@@ -30,7 +30,7 @@ def db_conn(db_pool):
 
 
 @pytest.fixture(scope="session", autouse=True)
-def init_schema(db_pool):
+def init_schema(db_pool, settings):
     from oramemvid.db import init_schema
     with db_pool.acquire() as conn:
-        init_schema(conn)
+        init_schema(conn, settings)

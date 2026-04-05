@@ -76,9 +76,32 @@ class OllamaEmbedding(EmbeddingProvider):
         return resp.json()["embeddings"]
 
 
+class SentenceTransformerEmbedding(EmbeddingProvider):
+    """Local embeddings via sentence-transformers. No server needed."""
+
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+        from sentence_transformers import SentenceTransformer
+        self._model = SentenceTransformer(model_name, device="cpu")
+        self._model_name = model_name
+
+    @property
+    def is_in_database(self) -> bool:
+        return False
+
+    def embed(self, text: str) -> list[float]:
+        vec = self._model.encode(text, normalize_embeddings=True)
+        return vec.tolist()
+
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        vecs = self._model.encode(texts, normalize_embeddings=True)
+        return vecs.tolist()
+
+
 def get_embedding_provider(settings: Settings) -> EmbeddingProvider:
     if settings.embedding_provider == "oracle_onnx":
         return OracleONNXEmbedding(model_name=settings.onnx_model_name.upper())
+    elif settings.embedding_provider == "sentence_transformers":
+        return SentenceTransformerEmbedding(model_name="all-MiniLM-L6-v2")
     elif settings.embedding_provider == "ollama":
         return OllamaEmbedding(
             ollama_url=settings.ollama_url,

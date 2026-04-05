@@ -37,7 +37,7 @@ def _release_conn(conn):
 async def lifespan(app: FastAPI):
     pool = get_pool(settings)
     with pool.acquire() as conn:
-        init_schema(conn)
+        init_schema(conn, settings)
     yield
     close_pool()
 
