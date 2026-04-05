@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     chunk_size: int = 512
     chunk_overlap: int = 50
 
-    model_config = {"env_prefix": "ORAMEMVID_"}
+    model_config = {"env_prefix": "ORAMEMVID_", "env_file": ".env"}
 
 
 def get_settings() -> Settings:
