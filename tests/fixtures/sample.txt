@@ -1,0 +1,8 @@
+Oracle Database is a multi-model database management system produced by Oracle Corporation.
+It supports SQL, JSON, XML, spatial data, and graph data, among others.
+Oracle AI Vector Search enables similarity search using vector embeddings stored directly in the database.
+This eliminates the need for a separate vector database.
+The VECTOR data type and VECTOR_DISTANCE function provide native vector operations.
+DBMS_VECTOR package allows loading ONNX models for in-database embedding generation.
+Oracle Text provides full-text search with BM25 ranking via the CONTAINS operator.
+Combined, these features make Oracle Database a powerful foundation for AI applications.
