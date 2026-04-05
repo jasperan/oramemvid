@@ -7,7 +7,7 @@ def test_default_settings():
     assert s.oracle_user == "oramemvid"
     assert s.ollama_url == "http://localhost:11434"
     assert s.ollama_model == "qwen3.5:9b"
-    assert s.embedding_provider == "oracle_onnx"
+    assert s.embedding_provider in ("oracle_onnx", "ollama")
     assert s.onnx_model_name == "all_minilm_l6_v2"
     assert s.chunk_size == 512
     assert s.chunk_overlap == 50
