@@ -1,5 +1,4 @@
 import os
-import pytest
 from unittest.mock import patch
 from oramemvid.ingest import extract_text, chunk_text, ingest_file, ingest_text
 from oramemvid.embeddings import OllamaEmbedding

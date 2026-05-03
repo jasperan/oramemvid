@@ -1,7 +1,10 @@
 """FastAPI REST API wiring all oramemvid modules together."""
 
+import os
 import tempfile
+import zipfile
 from contextlib import asynccontextmanager
+from pathlib import PurePosixPath
 
 from fastapi import FastAPI, HTTPException, Query, UploadFile
 from pydantic import BaseModel
@@ -9,7 +12,7 @@ from pydantic import BaseModel
 from oramemvid.config import get_settings
 from oramemvid.db import get_pool, close_pool, init_schema
 from oramemvid.embeddings import get_embedding_provider
-from oramemvid.frames import create_frame, get_frame, list_frames, delete_frame
+from oramemvid.frames import get_frame, list_frames, delete_frame
 from oramemvid.ingest import ingest_file, ingest_text
 from oramemvid.llm import get_llm_provider
 from oramemvid.memory_cards import (
@@ -23,6 +26,10 @@ from oramemvid.search import search_text, search_vector, search_hybrid
 settings = get_settings()
 embedding_provider = get_embedding_provider(settings)
 llm_provider = get_llm_provider(settings)
+_UPLOAD_COPY_CHUNK_BYTES = 1024 * 1024
+_MAX_OFFICE_ARCHIVE_MEMBERS = 1000
+_MAX_OFFICE_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
+_MAX_OFFICE_COMPRESSION_RATIO = 100
 
 
 def _get_conn():
@@ -31,6 +38,149 @@ def _get_conn():
 
 def _release_conn(conn):
     get_pool().release(conn)
+
+
+def _validate_upload_suffix(filename: str | None) -> str:
+    if not filename:
+        raise HTTPException(status_code=415, detail="Uploaded file must have a filename")
+    suffix = os.path.splitext(filename)[1].lower()
+    if not suffix or suffix not in settings.upload_extension_set:
+        allowed = ", ".join(sorted(settings.upload_extension_set))
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported file type. Allowed extensions: {allowed}",
+        )
+    return suffix
+
+
+def _write_upload_to_temp(file: UploadFile, suffix: str, max_bytes: int) -> str:
+    total = 0
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp_path = tmp.name
+            while True:
+                chunk = file.file.read(_UPLOAD_COPY_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Uploaded file exceeds {max_bytes} bytes",
+                    )
+                tmp.write(chunk)
+        return tmp_path
+    except Exception:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
+def _validate_upload_content(file_path: str, suffix: str) -> None:
+    try:
+        with open(file_path, "rb") as f:
+            header = f.read(8)
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail="Could not read uploaded file") from exc
+
+    if suffix == ".pdf":
+        if not header.startswith(b"%PDF-"):
+            raise HTTPException(status_code=415, detail="Uploaded file is not a PDF")
+        return
+
+    if suffix == ".txt":
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                for _ in f:
+                    pass
+        except UnicodeDecodeError as exc:
+            raise HTTPException(status_code=415, detail="Uploaded text file must be UTF-8") from exc
+        return
+
+    office_roots = {
+        ".docx": "word/",
+        ".xlsx": "xl/",
+        ".pptx": "ppt/",
+    }
+    expected_root = office_roots.get(suffix)
+    if expected_root is None:
+        return
+
+    if not zipfile.is_zipfile(file_path):
+        raise HTTPException(status_code=415, detail=f"Uploaded file is not a valid {suffix} archive")
+    try:
+        _validate_office_archive(file_path, suffix, expected_root)
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(status_code=415, detail=f"Uploaded file is not a valid {suffix} archive") from exc
+
+
+def _validate_office_archive(file_path: str, suffix: str, expected_root: str) -> None:
+    total_uncompressed = 0
+    saw_expected_root = False
+
+    with zipfile.ZipFile(file_path) as archive:
+        members = archive.infolist()
+        if len(members) > _MAX_OFFICE_ARCHIVE_MEMBERS:
+            raise HTTPException(status_code=413, detail="Office archive contains too many files")
+
+        for member in members:
+            name = member.filename
+            parts = PurePosixPath(name).parts
+            if name.startswith("/") or ".." in parts:
+                raise HTTPException(status_code=415, detail="Office archive contains an unsafe path")
+
+            saw_expected_root = saw_expected_root or name.startswith(expected_root)
+            total_uncompressed += member.file_size
+            if total_uncompressed > _MAX_OFFICE_UNCOMPRESSED_BYTES:
+                raise HTTPException(status_code=413, detail="Office archive expands too large")
+
+            if (
+                member.compress_size > 0
+                and member.file_size / member.compress_size > _MAX_OFFICE_COMPRESSION_RATIO
+            ):
+                raise HTTPException(status_code=413, detail="Office archive compression ratio is too high")
+
+    if not saw_expected_root:
+        raise HTTPException(status_code=415, detail=f"Uploaded file does not match {suffix} content")
+
+
+def _parse_tag_filters(tags: list[str] | None) -> dict[str, str] | None:
+    if not tags:
+        return None
+    parsed: dict[str, str] = {}
+    for raw in tags:
+        for item in raw.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if "=" not in item:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Tag filters must use key=value syntax",
+                )
+            key, value = item.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if not key or not value:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Tag filters must include both key and value",
+                )
+            parsed[key] = value
+    return parsed or None
+
+
+def _search_filter_args(
+    tags: list[str] | None,
+    entity: str | None,
+    kind: str | None,
+) -> dict:
+    return {
+        "tags": _parse_tag_filters(tags),
+        "entity": entity,
+        "kind": kind,
+    }
 
 
 @asynccontextmanager
@@ -83,29 +233,28 @@ def route_ingest_file(
     file: UploadFile,
     extract_memories: bool = Query(False),
 ):
-    conn = _get_conn()
+    suffix = _validate_upload_suffix(file.filename)
+    tmp_path = _write_upload_to_temp(file, suffix, settings.max_upload_bytes)
     try:
-        suffix = ""
-        if file.filename:
-            parts = file.filename.rsplit(".", 1)
-            if len(parts) == 2:
-                suffix = f".{parts[1]}"
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp.write(file.file.read())
-            tmp_path = tmp.name
-
-        llm = llm_provider if extract_memories else None
-        result = ingest_file(
-            conn=conn,
-            file_path=tmp_path,
-            provider=embedding_provider,
-            llm=llm,
-            chunk_size=settings.chunk_size,
-            chunk_overlap=settings.chunk_overlap,
-        )
-        return result
+        _validate_upload_content(tmp_path, suffix)
+        conn = _get_conn()
+        try:
+            llm = llm_provider if extract_memories else None
+            result = ingest_file(
+                conn=conn,
+                file_path=tmp_path,
+                provider=embedding_provider,
+                llm=llm,
+                chunk_size=settings.chunk_size,
+                chunk_overlap=settings.chunk_overlap,
+                filename=file.filename,
+            )
+            return result
+        finally:
+            _release_conn(conn)
     finally:
-        _release_conn(conn)
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 # --- Frame routes ---
@@ -158,15 +307,33 @@ def route_search(
     top_k: int = Query(10, ge=1, le=100),
     time_from: str | None = Query(None),
     time_to: str | None = Query(None),
+    tags: list[str] | None = Query(None, description="Tag filters as key=value"),
+    entity: str | None = Query(None),
+    kind: str | None = Query(None),
 ):
+    filter_args = _search_filter_args(tags, entity, kind)
     conn = _get_conn()
     try:
-        if mode == "text":
-            return search_text(conn, query, top_k=top_k, time_from=time_from, time_to=time_to)
-        elif mode == "vector":
-            return search_vector(conn, query, embedding_provider, top_k=top_k, time_from=time_from, time_to=time_to)
-        else:
-            return search_hybrid(conn, query, embedding_provider, top_k=top_k, time_from=time_from, time_to=time_to)
+        try:
+            if mode == "text":
+                return search_text(
+                    conn, query, top_k=top_k, time_from=time_from, time_to=time_to,
+                    **filter_args,
+                )
+            elif mode == "vector":
+                return search_vector(
+                    conn, query, embedding_provider, top_k=top_k,
+                    time_from=time_from, time_to=time_to,
+                    **filter_args,
+                )
+            else:
+                return search_hybrid(
+                    conn, query, embedding_provider, top_k=top_k,
+                    time_from=time_from, time_to=time_to,
+                    **filter_args,
+                )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         _release_conn(conn)
 
@@ -177,10 +344,20 @@ def route_search_text(
     top_k: int = Query(10, ge=1, le=100),
     time_from: str | None = Query(None),
     time_to: str | None = Query(None),
+    tags: list[str] | None = Query(None, description="Tag filters as key=value"),
+    entity: str | None = Query(None),
+    kind: str | None = Query(None),
 ):
+    filter_args = _search_filter_args(tags, entity, kind)
     conn = _get_conn()
     try:
-        return search_text(conn, query, top_k=top_k, time_from=time_from, time_to=time_to)
+        try:
+            return search_text(
+                conn, query, top_k=top_k, time_from=time_from, time_to=time_to,
+                **filter_args,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         _release_conn(conn)
 
@@ -191,10 +368,21 @@ def route_search_vector(
     top_k: int = Query(10, ge=1, le=100),
     time_from: str | None = Query(None),
     time_to: str | None = Query(None),
+    tags: list[str] | None = Query(None, description="Tag filters as key=value"),
+    entity: str | None = Query(None),
+    kind: str | None = Query(None),
 ):
+    filter_args = _search_filter_args(tags, entity, kind)
     conn = _get_conn()
     try:
-        return search_vector(conn, query, embedding_provider, top_k=top_k, time_from=time_from, time_to=time_to)
+        try:
+            return search_vector(
+                conn, query, embedding_provider, top_k=top_k,
+                time_from=time_from, time_to=time_to,
+                **filter_args,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         _release_conn(conn)
 

@@ -19,6 +19,7 @@ def create_frame(
     title: str | None = None,
     doc_id: int | None = None,
     tags: dict | None = None,
+    commit: bool = True,
 ) -> int:
     content_hash = _hash_content(content)
     cursor = conn.cursor()
@@ -63,7 +64,8 @@ def create_frame(
             "embedding": embedding, "frame_id": frame_id_var,
         })
 
-    conn.commit()
+    if commit:
+        conn.commit()
     return int(frame_id_var.getvalue()[0])
 
 

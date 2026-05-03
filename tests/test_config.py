@@ -1,4 +1,5 @@
 from oramemvid.config import Settings
+import pytest
 
 
 def test_default_settings():
@@ -24,3 +25,16 @@ def test_env_prefix(monkeypatch):
 def test_embedding_provider_validation():
     s = Settings(oracle_password="test", embedding_provider="ollama")
     assert s.embedding_provider == "ollama"
+
+
+def test_chunk_overlap_must_be_smaller_than_chunk_size():
+    with pytest.raises(ValueError, match="chunk_overlap"):
+        Settings(oracle_password="test", chunk_size=10, chunk_overlap=10)
+
+
+def test_upload_extension_set_normalizes_values():
+    settings = Settings(
+        oracle_password="test",
+        allowed_upload_extensions=".TXT, .pdf",
+    )
+    assert settings.upload_extension_set == {".txt", ".pdf"}

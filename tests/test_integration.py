@@ -1,5 +1,4 @@
 import os
-import pytest
 from unittest.mock import patch
 from oramemvid.embeddings import OllamaEmbedding
 from oramemvid.llm import OllamaLLM
@@ -14,7 +13,8 @@ FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
 def _mock_embed(text):
     import hashlib
     h = hashlib.md5(text.encode()).hexdigest()
-    return [int(h[i:i+2], 16) / 255.0 for i in range(0, min(256, len(h)), 2)][:384] + [0.0] * max(0, 384 - 128)
+    values = [int(h[i:i+2], 16) / 255.0 for i in range(0, len(h), 2)]
+    return (values + [0.0] * 384)[:384]
 
 
 def _mock_extract(content):
@@ -23,21 +23,19 @@ def _mock_extract(content):
     ]
 
 
-def test_full_pipeline(db_conn):
+def test_full_pipeline(db_conn, tmp_path):
     """End-to-end: ingest file, search, verify memories."""
     provider = OllamaEmbedding(ollama_url="http://localhost:11434", model="all-minilm")
     llm = OllamaLLM(ollama_url="http://localhost:11434", model="qwen3.5:9b")
-    path = os.path.join(FIXTURES, "sample.txt")
+    path = tmp_path / "sample-integration.txt"
+    with open(os.path.join(FIXTURES, "sample.txt"), encoding="utf-8") as fixture:
+        path.write_text(fixture.read() + f"\nunique integration path: {tmp_path}\n", encoding="utf-8")
 
     with (
         patch.object(provider, "embed", side_effect=_mock_embed),
         patch.object(llm, "extract_memories", side_effect=_mock_extract),
     ):
-        result = ingest_file(conn=db_conn, file_path=path, provider=provider, llm=llm)
-
-    # If sample.txt was already ingested by another test, it will be skipped
-    if result.get("skipped"):
-        pytest.skip("sample.txt already ingested in this test session")
+        result = ingest_file(conn=db_conn, file_path=str(path), provider=provider, llm=llm)
 
     assert result["total_frames"] >= 1
     assert result["skipped"] is False

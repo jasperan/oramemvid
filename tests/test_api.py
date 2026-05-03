@@ -2,6 +2,8 @@ import pytest
 from httpx import AsyncClient, ASGITransport
 from oramemvid.api import app
 
+pytestmark = pytest.mark.oracle
+
 
 @pytest.fixture
 async def client():

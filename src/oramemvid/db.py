@@ -1,4 +1,5 @@
 import os
+import re
 import tempfile
 
 import httpx
@@ -14,11 +15,27 @@ _ONNX_MODEL_URL = (
 SCHEMA_VERSION = 1
 
 _pool: oracledb.ConnectionPool | None = None
+_DB_IDENTIFIER_RE = re.compile(r"^[A-Z][A-Z0-9_$#]*$")
 
 # Tablespace with ASSM required for VECTOR and JSON types.
 # SYSTEM tablespace uses manual segment space management, so we
 # target an ASSM-enabled tablespace instead.
 _TABLESPACE = "PYTHIA_DATA"
+
+
+class OnnxModelLoadError(RuntimeError):
+    """Raised when oracle_onnx is configured but the model cannot be loaded."""
+
+
+def _validate_db_identifier(value: str, label: str) -> str:
+    value = value.upper()
+    if not _DB_IDENTIFIER_RE.fullmatch(value):
+        raise ValueError(f"Invalid Oracle {label}: {value!r}")
+    return value
+
+
+def _sql_string_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
 
 
 def get_pool(settings: Settings | None = None) -> oracledb.ConnectionPool:
@@ -107,15 +124,17 @@ def init_schema(conn: oracledb.Connection, settings: Settings | None = None):
 
     conn.commit()
 
-    # Auto-load ONNX embedding model if configured for in-database embeddings
+    # Auto-load ONNX embedding model if configured for in-database embeddings.
+    # If this fails, startup fails explicitly. The embedding provider cannot be
+    # switched from here because it is selected before schema initialization.
     if settings is None:
         settings = Settings()
     if settings.embedding_provider == "oracle_onnx":
-        try:
-            _ensure_onnx_model(conn, settings.onnx_model_name.upper())
-        except Exception as e:
-            print(f"Warning: ONNX auto-load failed: {e}")
-            print("Falling back to Ollama embeddings. Set ORAMEMVID_EMBEDDING_PROVIDER=ollama or =sentence_transformers")
+        _ensure_onnx_model(
+            conn,
+            _validate_db_identifier(settings.onnx_model_name, "model name"),
+            settings,
+        )
 
 
 def _apply_v1(cursor):
@@ -225,8 +244,7 @@ def _fix_onnx_for_oracle(model_bytes: bytes) -> bytes:
     3. Replaces the output with the pooled embedding [1, hidden_dim]
     """
     import onnx
-    from onnx import helper, TensorProto, numpy_helper
-    import numpy as np
+    from onnx import helper, TensorProto
 
     model = onnx.load_from_string(model_bytes)
 
@@ -268,19 +286,38 @@ def _fix_onnx_for_oracle(model_bytes: bytes) -> bytes:
     return model.SerializeToString()
 
 
-def _ensure_onnx_model(conn: oracledb.Connection, model_name: str):
+def _ensure_onnx_model(
+    conn: oracledb.Connection,
+    model_name: str,
+    settings: Settings | None = None,
+):
     """Check if ONNX model is loaded; if not, download, fix, and load it."""
+    if settings is None:
+        settings = Settings()
     cursor = conn.cursor()
     if _onnx_model_exists(cursor, model_name):
         return
 
     print(f"ONNX model '{model_name}' not found in Oracle. Auto-loading...")
 
-    model_bytes = _download_onnx_model(_ONNX_MODEL_URL)
+    try:
+        model_bytes = _download_onnx_model(_ONNX_MODEL_URL)
 
-    # Fix dynamic axes for Oracle compatibility
-    print("Fixing ONNX model dimensions for Oracle compatibility...")
-    model_bytes = _fix_onnx_for_oracle(model_bytes)
+        # Fix dynamic axes for Oracle compatibility
+        print("Fixing ONNX model dimensions for Oracle compatibility...")
+        model_bytes = _fix_onnx_for_oracle(model_bytes)
+    except ImportError as exc:
+        raise OnnxModelLoadError(
+            "oracle_onnx embeddings require the ONNX optional dependency. "
+            "Install with `pip install -e '.[oracle-onnx]'`, or set "
+            "ORAMEMVID_EMBEDDING_PROVIDER=ollama."
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise OnnxModelLoadError(
+            f"Could not download ONNX model from {_ONNX_MODEL_URL}. "
+            "Set ORAMEMVID_EMBEDDING_PROVIDER=ollama to skip in-database "
+            "embedding setup."
+        ) from exc
 
     metadata = '{"function":"embedding","input":{"input":["DATA"]},"output":{"embedding":["DATA"]}}'
 
@@ -309,7 +346,17 @@ def _ensure_onnx_model(conn: oracledb.Connection, model_name: str):
     except oracledb.DatabaseError as e:
         print(f"BLOB loading failed: {e}")
 
-    # Fallback: directory-based loading via SYSTEM user
+    # Fallback: directory-based loading. This requires explicit admin
+    # credentials because granting directory access is a privileged operation.
+    if not settings.oracle_admin_user or not settings.oracle_admin_password:
+        raise OnnxModelLoadError(
+            "BLOB-based ONNX loading failed, and directory-based loading "
+            "requires ORAMEMVID_ORACLE_ADMIN_USER and "
+            "ORAMEMVID_ORACLE_ADMIN_PASSWORD. Set those variables for Oracle "
+            "versions that require directory loading, pre-load the model "
+            "manually, or set ORAMEMVID_EMBEDDING_PROVIDER=ollama."
+        )
+
     with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
         tmp.write(model_bytes)
         tmp_path = tmp.name
@@ -317,31 +364,42 @@ def _ensure_onnx_model(conn: oracledb.Connection, model_name: str):
     try:
         tmp_dir = os.path.dirname(tmp_path)
         tmp_file = os.path.basename(tmp_path)
-        settings = Settings()
+        directory_name = _validate_db_identifier(
+            settings.onnx_directory_name,
+            "directory name",
+        )
+        schema_user = _validate_db_identifier(settings.oracle_user, "schema user")
 
-        sys_conn = oracledb.connect(
-            user="system", password="Welcome12345*", dsn=settings.oracle_dsn,
-        )
-        sys_cursor = sys_conn.cursor()
-        sys_cursor.execute(
-            f"CREATE OR REPLACE DIRECTORY onnx_model_dir AS '{tmp_dir}'"
-        )
-        sys_cursor.execute(
-            f"GRANT READ ON DIRECTORY onnx_model_dir TO {settings.oracle_user}"
-        )
-        sys_conn.commit()
-        sys_conn.close()
+        sys_conn = None
+        try:
+            sys_conn = oracledb.connect(
+                user=settings.oracle_admin_user,
+                password=settings.oracle_admin_password,
+                dsn=settings.oracle_dsn,
+            )
+            sys_cursor = sys_conn.cursor()
+            sys_cursor.execute(
+                f"CREATE OR REPLACE DIRECTORY {directory_name} AS {_sql_string_literal(tmp_dir)}"
+            )
+            sys_cursor.execute(
+                f"GRANT READ ON DIRECTORY {directory_name} TO {schema_user}"
+            )
+            sys_conn.commit()
+        finally:
+            if sys_conn is not None:
+                sys_conn.close()
 
         cursor.execute("""
             BEGIN
                 DBMS_VECTOR.LOAD_ONNX_MODEL(
                     :model_name,
-                    'onnx_model_dir/' || :filename,
+                    :directory_name || '/' || :filename,
                     JSON(:metadata)
                 );
             END;
         """, {
             "model_name": model_name,
+            "directory_name": directory_name,
             "filename": tmp_file,
             "metadata": metadata,
         })
@@ -349,10 +407,10 @@ def _ensure_onnx_model(conn: oracledb.Connection, model_name: str):
         print(f"ONNX model '{model_name}' loaded via directory successfully.")
 
     except oracledb.DatabaseError as e2:
-        print(
-            f"Warning: Could not auto-load ONNX model: {e2}\n"
-            f"Falling back to Ollama embeddings."
-        )
+        raise OnnxModelLoadError(
+            "Could not load the ONNX model through Oracle directory loading. "
+            "Pre-load the model manually or set ORAMEMVID_EMBEDDING_PROVIDER=ollama."
+        ) from e2
     finally:
         try:
             os.unlink(tmp_path)

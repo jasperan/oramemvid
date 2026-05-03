@@ -7,6 +7,15 @@ from oramemvid.llm import LLMProvider
 from oramemvid.memory_cards import create_memory_card
 
 
+def validate_chunking(chunk_size: int, chunk_overlap: int) -> None:
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be greater than 0")
+    if chunk_overlap < 0:
+        raise ValueError("chunk_overlap must be greater than or equal to 0")
+    if chunk_overlap >= chunk_size:
+        raise ValueError("chunk_overlap must be smaller than chunk_size")
+
+
 def extract_text(file_path: str) -> str:
     ext = os.path.splitext(file_path)[1].lower()
     if ext == ".txt":
@@ -50,6 +59,7 @@ def extract_text(file_path: str) -> str:
 
 
 def chunk_text(text: str, chunk_size: int = 512, chunk_overlap: int = 50) -> list[str]:
+    validate_chunking(chunk_size, chunk_overlap)
     words = text.split()
     if len(words) <= chunk_size:
         return [text.strip()] if text.strip() else []
@@ -75,9 +85,11 @@ def _hash_file(file_path: str) -> str:
 def ingest_file(
     conn: oracledb.Connection, file_path: str, provider: EmbeddingProvider,
     llm: LLMProvider | None = None, chunk_size: int = 512, chunk_overlap: int = 50,
+    filename: str | None = None,
 ) -> dict:
-    filename = os.path.basename(file_path)
-    ext = os.path.splitext(file_path)[1].lstrip(".").lower()
+    validate_chunking(chunk_size, chunk_overlap)
+    filename = os.path.basename(filename or file_path)
+    ext = os.path.splitext(filename)[1].lstrip(".").lower()
     file_hash = _hash_file(file_path)
     cursor = conn.cursor()
 
@@ -86,37 +98,40 @@ def ingest_file(
     if existing:
         return {"doc_id": existing[0], "filename": filename, "total_frames": existing[1], "skipped": True}
 
-    doc_id_var = cursor.var(oracledb.NUMBER)
-    cursor.execute("""
-        INSERT INTO documents (filename, doc_type, file_hash)
-        VALUES (:filename, :doc_type, :hash) RETURNING doc_id INTO :doc_id
-    """, {"filename": filename, "doc_type": ext or "txt", "hash": file_hash, "doc_id": doc_id_var})
-    conn.commit()
-    doc_id = int(doc_id_var.getvalue()[0])
-
     text = extract_text(file_path)
     chunks = chunk_text(text, chunk_size, chunk_overlap)
 
-    frame_ids = []
-    for i, chunk in enumerate(chunks):
-        uri = f"file://{filename}/chunk/{i}"
-        frame_id = create_frame(
-            conn=conn, uri=uri, content=chunk, provider=provider,
-            title=f"{filename} (chunk {i})", doc_id=doc_id,
-        )
-        frame_ids.append(frame_id)
-        if llm is not None:
-            cards = llm.extract_memories(chunk)
-            for card in cards:
-                create_memory_card(
-                    conn=conn, entity=card.get("entity", "unknown"),
-                    slot=card.get("slot", "unknown"), value=card.get("value", ""),
-                    kind=card.get("kind", "Fact"), source_frame_id=frame_id,
-                    confidence=card.get("confidence", 1.0),
-                )
+    try:
+        doc_id_var = cursor.var(oracledb.NUMBER)
+        cursor.execute("""
+            INSERT INTO documents (filename, doc_type, file_hash)
+            VALUES (:filename, :doc_type, :hash) RETURNING doc_id INTO :doc_id
+        """, {"filename": filename, "doc_type": ext or "txt", "hash": file_hash, "doc_id": doc_id_var})
+        doc_id = int(doc_id_var.getvalue()[0])
 
-    cursor.execute("UPDATE documents SET total_frames = :count WHERE doc_id = :id", {"count": len(frame_ids), "id": doc_id})
-    conn.commit()
+        frame_ids = []
+        for i, chunk in enumerate(chunks):
+            uri = f"file://{filename}/chunk/{i}"
+            frame_id = create_frame(
+                conn=conn, uri=uri, content=chunk, provider=provider,
+                title=f"{filename} (chunk {i})", doc_id=doc_id, commit=False,
+            )
+            frame_ids.append(frame_id)
+            if llm is not None:
+                cards = llm.extract_memories(chunk)
+                for card in cards:
+                    create_memory_card(
+                        conn=conn, entity=card.get("entity", "unknown"),
+                        slot=card.get("slot", "unknown"), value=card.get("value", ""),
+                        kind=card.get("kind", "Fact"), source_frame_id=frame_id,
+                        confidence=card.get("confidence", 1.0), commit=False,
+                    )
+
+        cursor.execute("UPDATE documents SET total_frames = :count WHERE doc_id = :id", {"count": len(frame_ids), "id": doc_id})
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     return {"doc_id": doc_id, "filename": filename, "total_frames": len(frame_ids), "frame_ids": frame_ids, "skipped": False}
 
 
@@ -126,21 +141,28 @@ def ingest_text(
     chunk_size: int = 512, chunk_overlap: int = 50,
 ) -> dict:
     chunks = chunk_text(text, chunk_size, chunk_overlap)
-    frame_ids = []
-    for i, chunk in enumerate(chunks):
-        chunk_uri = f"{uri}/chunk/{i}" if len(chunks) > 1 else uri
-        frame_id = create_frame(
-            conn=conn, uri=chunk_uri, content=chunk, provider=provider,
-            title=title or f"text (chunk {i})",
-        )
-        frame_ids.append(frame_id)
-        if llm is not None:
-            cards = llm.extract_memories(chunk)
-            for card in cards:
-                create_memory_card(
-                    conn=conn, entity=card.get("entity", "unknown"),
-                    slot=card.get("slot", "unknown"), value=card.get("value", ""),
-                    kind=card.get("kind", "Fact"), source_frame_id=frame_id,
-                    confidence=card.get("confidence", 1.0),
-                )
+    frame_ids: list[int] = []
+    if not chunks:
+        return {"uri": uri, "total_frames": 0, "frame_ids": frame_ids}
+    try:
+        for i, chunk in enumerate(chunks):
+            chunk_uri = f"{uri}/chunk/{i}" if len(chunks) > 1 else uri
+            frame_id = create_frame(
+                conn=conn, uri=chunk_uri, content=chunk, provider=provider,
+                title=title or f"text (chunk {i})", commit=False,
+            )
+            frame_ids.append(frame_id)
+            if llm is not None:
+                cards = llm.extract_memories(chunk)
+                for card in cards:
+                    create_memory_card(
+                        conn=conn, entity=card.get("entity", "unknown"),
+                        slot=card.get("slot", "unknown"), value=card.get("value", ""),
+                        kind=card.get("kind", "Fact"), source_frame_id=frame_id,
+                        confidence=card.get("confidence", 1.0), commit=False,
+                    )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     return {"uri": uri, "total_frames": len(frame_ids), "frame_ids": frame_ids}

@@ -1,7 +1,6 @@
 import pytest
 from unittest.mock import patch, MagicMock
 from oramemvid.embeddings import (
-    EmbeddingProvider,
     OracleONNXEmbedding,
     OllamaEmbedding,
     get_embedding_provider,

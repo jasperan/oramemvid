@@ -8,6 +8,7 @@ def create_memory_card(
     entity: str, slot: str, value: str, kind: str,
     source_frame_id: int | None = None,
     confidence: float = 1.0, expires_at=None,
+    commit: bool = True,
 ) -> int:
     if kind not in VALID_KINDS:
         raise ValueError(f"Invalid kind '{kind}'. Must be one of: {VALID_KINDS}")
@@ -23,7 +24,8 @@ def create_memory_card(
         "frame_id": source_frame_id, "confidence": confidence,
         "expires_at": expires_at, "card_id": card_id_var,
     })
-    conn.commit()
+    if commit:
+        conn.commit()
     return int(card_id_var.getvalue()[0])
 
 

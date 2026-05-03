@@ -7,7 +7,7 @@ AI memory layer backed by Oracle Database, inspired by memvid.
 ```bash
 conda activate oramemvid
 docker compose up -d          # Oracle 26ai Free; first boot takes ~2 min
-pip install -e ".[dev]"
+pip install -e ".[dev,oracle-onnx]"
 python -m oramemvid.db        # init schema + auto-load ONNX model
 uvicorn oramemvid.api:app --reload
 ```
@@ -31,13 +31,18 @@ Run a single module: `pytest tests/test_search.py -v`
 | `ORAMEMVID_ORACLE_DSN` | `localhost:1523/FREEPDB1` | |
 | `ORAMEMVID_ORACLE_USER` | `oramemvid` | |
 | `ORAMEMVID_ORACLE_PASSWORD` | *(required)* | `oramemvid_dev` in docker-compose |
+| `ORAMEMVID_ORACLE_ADMIN_USER` | *(unset)* | Optional; enables directory-based ONNX loading fallback |
+| `ORAMEMVID_ORACLE_ADMIN_PASSWORD` | *(unset)* | Optional; enables directory-based ONNX loading fallback |
 | `ORAMEMVID_OLLAMA_URL` | `http://localhost:11434` | |
 | `ORAMEMVID_OLLAMA_MODEL` | `qwen3.5:9b` | LLM for extraction |
 | `ORAMEMVID_EMBEDDING_PROVIDER` | `oracle_onnx` | `oracle_onnx` / `ollama` / `sentence_transformers` |
 | `ORAMEMVID_ONNX_MODEL_NAME` | `all_minilm_l6_v2` | Oracle mining model name |
+| `ORAMEMVID_ONNX_DIRECTORY_NAME` | `onnx_model_dir` | Oracle directory object for fallback loading |
 | `ORAMEMVID_OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Used when provider=ollama |
-| `ORAMEMVID_CHUNK_SIZE` | `512` | Tokens per frame |
-| `ORAMEMVID_CHUNK_OVERLAP` | `50` | |
+| `ORAMEMVID_CHUNK_SIZE` | `512` | Words per frame |
+| `ORAMEMVID_CHUNK_OVERLAP` | `50` | Overlap words; must be smaller than chunk size |
+| `ORAMEMVID_MAX_UPLOAD_BYTES` | `52428800` | Max `/ingest/file` upload size |
+| `ORAMEMVID_ALLOWED_UPLOAD_EXTENSIONS` | `.txt,.pdf,.docx,.xlsx,.pptx` | Upload extension allowlist |
 
 ## Tech Stack
 
@@ -72,12 +77,12 @@ Schema migrations are tracked in `schema_version`. Current version: 1.
 
 ## Gotchas
 
-**ONNX model loading** happens automatically during `init_schema`. It downloads all-MiniLM-L6-v2 from HuggingFace (~90 MB), patches the ONNX graph to fix dynamic axes Oracle doesn't support, then loads it via `DBMS_VECTOR.LOAD_ONNX_MODEL`. This requires the `onnx` package (`pip install onnx`) which is not in `pyproject.toml` — add it if you need oracle_onnx embeddings.
+**ONNX model loading** happens automatically during `init_schema` when `ORAMEMVID_EMBEDDING_PROVIDER=oracle_onnx`. It downloads all-MiniLM-L6-v2 from HuggingFace (~90 MB), patches the ONNX graph to fix dynamic axes Oracle doesn't support, then loads it via `DBMS_VECTOR.LOAD_ONNX_MODEL`. Install the optional dependency with `pip install -e ".[oracle-onnx]"` or use the dev extra shown above.
 
-**ONNX directory fallback**: if BLOB loading fails, the code falls back to a directory-based load using a hardcoded `system` password `Welcome12345*`. This only works against the docker-compose Oracle image. Override in `db.py` if your Oracle setup differs.
+**ONNX directory fallback**: if BLOB loading fails, the code attempts directory-based loading only when `ORAMEMVID_ORACLE_ADMIN_USER` and `ORAMEMVID_ORACLE_ADMIN_PASSWORD` are explicitly set. If they are not set, startup fails with remediation instructions instead of silently switching providers.
 
 **ASSM tablespace**: `db.py` auto-detects an ASSM tablespace. If your Oracle user's default tablespace isn't ASSM, it picks the first available one. The hardcoded fallback name `PYTHIA_DATA` is vestigial and may not exist — the detection logic will handle it.
 
-**First `pytest` run** initializes the schema and may download the ONNX model. Can take several minutes. Subsequent runs are fast.
+**First Oracle-backed `pytest` run** initializes the schema and may download the ONNX model. Can take several minutes. Pure unit tests run without Oracle; tests using `db_conn`, `db_pool`, or the `oracle` marker require Oracle and are skipped when the database is unavailable.
 
 **`asyncio_mode = "auto"`** is set in `pyproject.toml` — all async tests work without `@pytest.mark.asyncio`.

@@ -23,8 +23,8 @@ docker compose up -d
 conda create -n oramemvid python=3.12 -y
 conda activate oramemvid
 
-# Install
-pip install -e ".[dev]"
+# Install. The oracle-onnx extra supports the default embedding provider.
+pip install -e ".[dev,oracle-onnx]"
 
 # Copy and edit .env
 cp .env.example .env
@@ -79,10 +79,17 @@ All settings via environment variables with `ORAMEMVID_` prefix:
 | `ORAMEMVID_ORACLE_DSN` | `localhost:1523/FREEPDB1` | Oracle connection string |
 | `ORAMEMVID_ORACLE_USER` | `oramemvid` | Database user |
 | `ORAMEMVID_ORACLE_PASSWORD` | (required) | Database password |
-| `ORAMEMVID_EMBEDDING_PROVIDER` | `oracle_onnx` | `oracle_onnx` or `ollama` |
+| `ORAMEMVID_ORACLE_ADMIN_USER` | unset | Optional admin user for directory-based ONNX loading |
+| `ORAMEMVID_ORACLE_ADMIN_PASSWORD` | unset | Optional admin password for directory-based ONNX loading |
+| `ORAMEMVID_EMBEDDING_PROVIDER` | `oracle_onnx` | `oracle_onnx`, `ollama`, or `sentence_transformers` |
+| `ORAMEMVID_ONNX_MODEL_NAME` | `all_minilm_l6_v2` | Oracle mining model name |
 | `ORAMEMVID_OLLAMA_URL` | `http://localhost:11434` | Ollama API endpoint |
 | `ORAMEMVID_OLLAMA_MODEL` | `qwen3.5:9b` | LLM for memory extraction |
-| `ORAMEMVID_OLLAMA_EMBED_MODEL` | `all-minilm` | Embedding model for Ollama fallback |
+| `ORAMEMVID_OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Embedding model for Ollama fallback |
+| `ORAMEMVID_CHUNK_SIZE` | `512` | Words per frame chunk |
+| `ORAMEMVID_CHUNK_OVERLAP` | `50` | Overlap words; must be smaller than chunk size |
+| `ORAMEMVID_MAX_UPLOAD_BYTES` | `52428800` | Maximum `/ingest/file` upload size |
+| `ORAMEMVID_ALLOWED_UPLOAD_EXTENSIONS` | `.txt,.pdf,.docx,.xlsx,.pptx` | Upload extension allowlist |
 
 ## Testing
 
@@ -90,4 +97,23 @@ All settings via environment variables with `ORAMEMVID_` prefix:
 pytest tests/ -v
 ```
 
-Requires a running Oracle 26ai Free instance.
+Pure unit tests run without Oracle. Tests that use `db_conn`, `db_pool`, or
+the `oracle` marker require a running Oracle 26ai Free instance; if Oracle is
+unavailable, those tests are skipped with the connection error.
+
+## Bootstrap Notes
+
+`oracle_onnx` is the default embedding provider. If the model is not already
+loaded in Oracle, schema initialization downloads and patches the ONNX model,
+then loads it with `DBMS_VECTOR.LOAD_ONNX_MODEL`. If BLOB loading is not
+supported by the target Oracle version, directory-based loading is attempted
+only when `ORAMEMVID_ORACLE_ADMIN_USER` and
+`ORAMEMVID_ORACLE_ADMIN_PASSWORD` are explicitly set. Otherwise startup fails
+with instructions instead of silently pretending to fall back to another
+provider.
+
+To avoid ONNX setup entirely during local development, set:
+
+```bash
+export ORAMEMVID_EMBEDDING_PROVIDER=ollama
+```

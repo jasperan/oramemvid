@@ -1,7 +1,6 @@
 import json
-import pytest
 from unittest.mock import patch, MagicMock
-from oramemvid.llm import LLMProvider, OllamaLLM, get_llm_provider
+from oramemvid.llm import OllamaLLM, get_llm_provider
 from oramemvid.config import Settings
 
 MOCK_EXTRACTION_RESPONSE = json.dumps([
