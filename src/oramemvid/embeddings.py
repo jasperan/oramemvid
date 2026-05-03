@@ -1,8 +1,18 @@
+import re
 from abc import ABC, abstractmethod
 
 import httpx
 
 from oramemvid.config import Settings
+
+_DB_IDENTIFIER_RE = re.compile(r"^[A-Z][A-Z0-9_$#]*$")
+
+
+def _validate_db_identifier(value: str, label: str) -> str:
+    value = value.upper()
+    if not _DB_IDENTIFIER_RE.fullmatch(value):
+        raise ValueError(f"Invalid Oracle {label}: {value!r}")
+    return value
 
 
 class EmbeddingProvider(ABC):
@@ -28,7 +38,7 @@ class OracleONNXEmbedding(EmbeddingProvider):
     """
 
     def __init__(self, model_name: str = "ALL_MINILM_L6_V2"):
-        self.model_name = model_name
+        self.model_name = _validate_db_identifier(model_name, "model name")
 
     @property
     def is_in_database(self) -> bool:

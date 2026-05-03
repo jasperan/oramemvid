@@ -6,7 +6,8 @@ import zipfile
 from contextlib import asynccontextmanager
 from pathlib import PurePosixPath
 
-from fastapi import FastAPI, HTTPException, Query, UploadFile
+from fastapi import FastAPI, HTTPException, Query, Request, UploadFile
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from oramemvid.config import get_settings
@@ -30,6 +31,7 @@ _UPLOAD_COPY_CHUNK_BYTES = 1024 * 1024
 _MAX_OFFICE_ARCHIVE_MEMBERS = 1000
 _MAX_OFFICE_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
 _MAX_OFFICE_COMPRESSION_RATIO = 100
+_MULTIPART_OVERHEAD_BYTES = 1024 * 1024
 
 
 def _get_conn():
@@ -87,6 +89,7 @@ def _validate_upload_content(file_path: str, suffix: str) -> None:
     if suffix == ".pdf":
         if not header.startswith(b"%PDF-"):
             raise HTTPException(status_code=415, detail="Uploaded file is not a PDF")
+        _validate_pdf_parseable(file_path)
         return
 
     if suffix == ".txt":
@@ -98,26 +101,36 @@ def _validate_upload_content(file_path: str, suffix: str) -> None:
             raise HTTPException(status_code=415, detail="Uploaded text file must be UTF-8") from exc
         return
 
-    office_roots = {
-        ".docx": "word/",
-        ".xlsx": "xl/",
-        ".pptx": "ppt/",
+    office_expectations = {
+        ".docx": ("word/", "word/document.xml"),
+        ".xlsx": ("xl/", "xl/workbook.xml"),
+        ".pptx": ("ppt/", "ppt/presentation.xml"),
     }
-    expected_root = office_roots.get(suffix)
-    if expected_root is None:
+    expected = office_expectations.get(suffix)
+    if expected is None:
         return
+    expected_root, required_document = expected
 
     if not zipfile.is_zipfile(file_path):
         raise HTTPException(status_code=415, detail=f"Uploaded file is not a valid {suffix} archive")
     try:
-        _validate_office_archive(file_path, suffix, expected_root)
+        _validate_office_archive(file_path, suffix, expected_root, required_document)
     except zipfile.BadZipFile as exc:
         raise HTTPException(status_code=415, detail=f"Uploaded file is not a valid {suffix} archive") from exc
+    _validate_office_parseable(file_path, suffix)
 
 
-def _validate_office_archive(file_path: str, suffix: str, expected_root: str) -> None:
+def _validate_office_archive(
+    file_path: str,
+    suffix: str,
+    expected_root: str,
+    required_document: str,
+) -> None:
     total_uncompressed = 0
     saw_expected_root = False
+    saw_content_types = False
+    saw_relationships = False
+    saw_required_document = False
 
     with zipfile.ZipFile(file_path) as archive:
         members = archive.infolist()
@@ -131,6 +144,9 @@ def _validate_office_archive(file_path: str, suffix: str, expected_root: str) ->
                 raise HTTPException(status_code=415, detail="Office archive contains an unsafe path")
 
             saw_expected_root = saw_expected_root or name.startswith(expected_root)
+            saw_content_types = saw_content_types or name == "[Content_Types].xml"
+            saw_relationships = saw_relationships or name == "_rels/.rels"
+            saw_required_document = saw_required_document or name == required_document
             total_uncompressed += member.file_size
             if total_uncompressed > _MAX_OFFICE_UNCOMPRESSED_BYTES:
                 raise HTTPException(status_code=413, detail="Office archive expands too large")
@@ -143,6 +159,42 @@ def _validate_office_archive(file_path: str, suffix: str, expected_root: str) ->
 
     if not saw_expected_root:
         raise HTTPException(status_code=415, detail=f"Uploaded file does not match {suffix} content")
+    if not (saw_content_types and saw_relationships and saw_required_document):
+        raise HTTPException(status_code=415, detail=f"Uploaded file is missing required {suffix} structure")
+
+
+def _validate_pdf_parseable(file_path: str) -> None:
+    doc = None
+    try:
+        import pymupdf
+
+        doc = pymupdf.open(file_path)
+        if doc.needs_pass:
+            raise ValueError("encrypted PDF is not supported")
+    except Exception as exc:
+        raise HTTPException(status_code=415, detail="Uploaded file is not a parseable PDF") from exc
+    finally:
+        if doc is not None:
+            doc.close()
+
+
+def _validate_office_parseable(file_path: str, suffix: str) -> None:
+    try:
+        if suffix == ".docx":
+            from docx import Document
+
+            Document(file_path)
+        elif suffix == ".xlsx":
+            from openpyxl import load_workbook
+
+            workbook = load_workbook(file_path, read_only=True)
+            workbook.close()
+        elif suffix == ".pptx":
+            from pptx import Presentation
+
+            Presentation(file_path)
+    except Exception as exc:
+        raise HTTPException(status_code=415, detail=f"Uploaded file is not a parseable {suffix} file") from exc
 
 
 def _parse_tag_filters(tags: list[str] | None) -> dict[str, str] | None:
@@ -193,6 +245,22 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="oramemvid", version="0.1.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def reject_large_upload_requests(request: Request, call_next):
+    if request.url.path == "/ingest/file" and request.method == "POST":
+        content_length = request.headers.get("content-length")
+        limit = settings.max_upload_bytes + _MULTIPART_OVERHEAD_BYTES
+        if content_length is None:
+            return JSONResponse({"detail": "Content-Length header is required"}, status_code=411)
+        try:
+            request_size = int(content_length)
+        except ValueError:
+            return JSONResponse({"detail": "Invalid Content-Length header"}, status_code=400)
+        if request_size > limit:
+            return JSONResponse({"detail": f"Upload request exceeds {limit} bytes"}, status_code=413)
+    return await call_next(request)
 
 
 # --- Request models ---

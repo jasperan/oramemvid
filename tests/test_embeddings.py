@@ -15,6 +15,11 @@ def test_oracle_onnx_sql_fragment():
     assert "ALL_MINILM_L6_V2" in fragment
 
 
+def test_oracle_onnx_rejects_invalid_model_name():
+    with pytest.raises(ValueError, match="Invalid Oracle model name"):
+        OracleONNXEmbedding(model_name="ALL_MINILM_L6_V2) OR 1=1 --")
+
+
 def test_oracle_onnx_is_in_database():
     provider = OracleONNXEmbedding(model_name="ALL_MINILM_L6_V2")
     assert provider.is_in_database is True
