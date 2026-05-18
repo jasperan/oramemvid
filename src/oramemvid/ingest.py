@@ -82,6 +82,23 @@ def _hash_file(file_path: str) -> str:
     return h.hexdigest()
 
 
+def _create_memory_cards(
+    conn: oracledb.Connection,
+    llm: LLMProvider | None,
+    chunk: str,
+    frame_id: int,
+) -> None:
+    if llm is None:
+        return
+    for card in llm.extract_memories(chunk):
+        create_memory_card(
+            conn=conn, entity=card.get("entity", "unknown"),
+            slot=card.get("slot", "unknown"), value=card.get("value", ""),
+            kind=card.get("kind", "Fact"), source_frame_id=frame_id,
+            confidence=card.get("confidence", 1.0), commit=False,
+        )
+
+
 def ingest_file(
     conn: oracledb.Connection, file_path: str, provider: EmbeddingProvider,
     llm: LLMProvider | None = None, chunk_size: int = 512, chunk_overlap: int = 50,
@@ -117,15 +134,7 @@ def ingest_file(
                 title=f"{filename} (chunk {i})", doc_id=doc_id, commit=False,
             )
             frame_ids.append(frame_id)
-            if llm is not None:
-                cards = llm.extract_memories(chunk)
-                for card in cards:
-                    create_memory_card(
-                        conn=conn, entity=card.get("entity", "unknown"),
-                        slot=card.get("slot", "unknown"), value=card.get("value", ""),
-                        kind=card.get("kind", "Fact"), source_frame_id=frame_id,
-                        confidence=card.get("confidence", 1.0), commit=False,
-                    )
+            _create_memory_cards(conn, llm, chunk, frame_id)
 
         cursor.execute("UPDATE documents SET total_frames = :count WHERE doc_id = :id", {"count": len(frame_ids), "id": doc_id})
         conn.commit()
@@ -152,15 +161,7 @@ def ingest_text(
                 title=title or f"text (chunk {i})", commit=False,
             )
             frame_ids.append(frame_id)
-            if llm is not None:
-                cards = llm.extract_memories(chunk)
-                for card in cards:
-                    create_memory_card(
-                        conn=conn, entity=card.get("entity", "unknown"),
-                        slot=card.get("slot", "unknown"), value=card.get("value", ""),
-                        kind=card.get("kind", "Fact"), source_frame_id=frame_id,
-                        confidence=card.get("confidence", 1.0), commit=False,
-                    )
+            _create_memory_cards(conn, llm, chunk, frame_id)
         conn.commit()
     except Exception:
         conn.rollback()

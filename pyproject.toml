@@ -22,7 +22,7 @@ dependencies = [
 
 [project.optional-dependencies]
 oracle-onnx = [
-    "onnx>=1.16",
+    "onnx2oracle>=0.1.1",
 ]
 sentence-transformers = [
     "sentence-transformers>=3.0",

@@ -79,8 +79,6 @@ All settings via environment variables with `ORAMEMVID_` prefix:
 | `ORAMEMVID_ORACLE_DSN` | `localhost:1523/FREEPDB1` | Oracle connection string |
 | `ORAMEMVID_ORACLE_USER` | `oramemvid` | Database user |
 | `ORAMEMVID_ORACLE_PASSWORD` | (required) | Database password |
-| `ORAMEMVID_ORACLE_ADMIN_USER` | unset | Optional admin user for directory-based ONNX loading |
-| `ORAMEMVID_ORACLE_ADMIN_PASSWORD` | unset | Optional admin password for directory-based ONNX loading |
 | `ORAMEMVID_EMBEDDING_PROVIDER` | `oracle_onnx` | `oracle_onnx`, `ollama`, or `sentence_transformers` |
 | `ORAMEMVID_ONNX_MODEL_NAME` | `all_minilm_l6_v2` | Oracle mining model name |
 | `ORAMEMVID_OLLAMA_URL` | `http://localhost:11434` | Ollama API endpoint |
@@ -104,13 +102,10 @@ unavailable, those tests are skipped with the connection error.
 ## Bootstrap Notes
 
 `oracle_onnx` is the default embedding provider. If the model is not already
-loaded in Oracle, schema initialization downloads and patches the ONNX model,
-then loads it with `DBMS_VECTOR.LOAD_ONNX_MODEL`. If BLOB loading is not
-supported by the target Oracle version, directory-based loading is attempted
-only when `ORAMEMVID_ORACLE_ADMIN_USER` and
-`ORAMEMVID_ORACLE_ADMIN_PASSWORD` are explicitly set. Otherwise startup fails
-with instructions instead of silently pretending to fall back to another
-provider.
+loaded in Oracle, schema initialization uses `onnx2oracle` to build an
+Oracle-compatible tokenizer-plus-transformer ONNX pipeline, then loads it with
+`DBMS_VECTOR.LOAD_ONNX_MODEL`. Startup fails explicitly if the model cannot be
+built or loaded instead of silently pretending to fall back to another provider.
 
 To avoid ONNX setup entirely during local development, set:
 

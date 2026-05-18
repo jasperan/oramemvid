@@ -1,18 +1,10 @@
-import os
 import re
-import tempfile
 
-import httpx
 import oracledb
 from oramemvid.config import Settings
 
-# Hugging Face ONNX model URL for all-MiniLM-L6-v2
-_ONNX_MODEL_URL = (
-    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2"
-    "/resolve/main/onnx/model.onnx"
-)
-
 SCHEMA_VERSION = 1
+EMBEDDING_DIMS = 384
 
 _pool: oracledb.ConnectionPool | None = None
 _DB_IDENTIFIER_RE = re.compile(r"^[A-Z][A-Z0-9_$#]*$")
@@ -32,10 +24,6 @@ def _validate_db_identifier(value: str, label: str) -> str:
     if not _DB_IDENTIFIER_RE.fullmatch(value):
         raise ValueError(f"Invalid Oracle {label}: {value!r}")
     return value
-
-
-def _sql_string_literal(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
 
 
 def get_pool(settings: Settings | None = None) -> oracledb.ConnectionPool:
@@ -165,7 +153,7 @@ def _apply_v1(cursor):
                 encoding      VARCHAR2(20) DEFAULT 'raw',
                 doc_id        NUMBER REFERENCES documents(doc_id),
                 tags          JSON,
-                embedding     VECTOR(384, FLOAT32),
+                embedding     VECTOR({EMBEDDING_DIMS}, FLOAT32),
                 created_at    TIMESTAMP DEFAULT SYSTIMESTAMP,
                 CONSTRAINT frames_hash_uk UNIQUE (content_hash)
             ) TABLESPACE {ts}
@@ -218,72 +206,40 @@ def _onnx_model_exists(cursor, model_name: str) -> bool:
     return cursor.fetchone()[0] > 0
 
 
-def _download_onnx_model(url: str) -> bytes:
-    """Download ONNX model file from URL, return raw bytes."""
-    print(f"Downloading ONNX model from {url}...")
-    with httpx.stream("GET", url, follow_redirects=True, timeout=300.0) as resp:
-        resp.raise_for_status()
-        chunks = []
-        for chunk in resp.iter_bytes():
-            chunks.append(chunk)
-    data = b"".join(chunks)
-    print(f"Downloaded {len(data) / 1024 / 1024:.1f} MB")
-    return data
+def _onnx2oracle_spec(model_name: str, presets=None):
+    if presets is None:
+        from onnx2oracle.presets import PRESETS
 
+        presets = PRESETS
 
-def _fix_onnx_for_oracle(model_bytes: bytes) -> bytes:
-    """Prepare ONNX model for Oracle DBMS_VECTOR.LOAD_ONNX_MODEL.
-
-    Standard HuggingFace transformer ONNX exports output per-token
-    hidden states [batch, seq_len, hidden_dim]. Oracle needs a model
-    that outputs a single embedding vector [hidden_dim].
-
-    This function:
-    1. Fixes batch_size to 1 (Oracle allows at most 1 dynamic dim)
-    2. Adds a ReduceMean pooling node over the sequence dimension
-    3. Replaces the output with the pooled embedding [1, hidden_dim]
-    """
-    import onnx
-    from onnx import helper, TensorProto
-
-    model = onnx.load_from_string(model_bytes)
-
-    # Fix batch_size to 1 on all inputs (keep sequence_length dynamic)
-    for tensor in model.graph.input:
-        shape = tensor.type.tensor_type.shape
-        if shape is None:
-            continue
-        for dim in shape.dim:
-            if dim.dim_param == "batch_size":
-                dim.ClearField("dim_param")
-                dim.dim_value = 1
-
-    # Find the original output (last_hidden_state: [batch, seq_len, 384])
-    orig_output = model.graph.output[0]
-    orig_output_name = orig_output.name
-
-    # Get hidden_dim from the output shape (last dimension)
-    hidden_dim = orig_output.type.tensor_type.shape.dim[-1].dim_value
-
-    # Add ReduceMean node: mean over axis=1 (sequence dimension)
-    # This pools [1, seq_len, 384] -> [1, 384]
-    reduce_mean_node = helper.make_node(
-        "ReduceMean",
-        inputs=[orig_output_name],
-        outputs=["embedding"],
-        axes=[1],
-        keepdims=0,
+    for spec in presets.values():
+        if spec.oracle_name == model_name:
+            if spec.dims != EMBEDDING_DIMS:
+                raise OnnxModelLoadError(
+                    f"Unsupported ONNX model {model_name!r}: onnx2oracle preset "
+                    f"outputs {spec.dims} dimensions, but the schema requires "
+                    f"{EMBEDDING_DIMS}."
+                )
+            return spec
+    available = ", ".join(
+        sorted(spec.oracle_name for spec in presets.values() if spec.dims == EMBEDDING_DIMS)
     )
-    model.graph.node.append(reduce_mean_node)
-
-    # Replace the output with the pooled embedding
-    del model.graph.output[:]
-    new_output = helper.make_tensor_value_info(
-        "embedding", TensorProto.FLOAT, [1, hidden_dim]
+    raise OnnxModelLoadError(
+        f"Unsupported ONNX model {model_name!r}. "
+        f"Compatible onnx2oracle presets for ORAMEMVID_ONNX_MODEL_NAME: {available}."
     )
-    model.graph.output.append(new_output)
 
-    return model.SerializeToString()
+
+def _build_oracle_onnx_model(model_name: str) -> bytes:
+    from onnx2oracle.pipeline import build_augmented
+
+    return build_augmented(_onnx2oracle_spec(model_name))
+
+
+def _onnx_metadata_json() -> str:
+    from onnx2oracle.loader import build_metadata_json
+
+    return build_metadata_json()
 
 
 def _ensure_onnx_model(
@@ -298,124 +254,47 @@ def _ensure_onnx_model(
     if _onnx_model_exists(cursor, model_name):
         return
 
-    print(f"ONNX model '{model_name}' not found in Oracle. Auto-loading...")
+    print(f"ONNX model '{model_name}' not found in Oracle. Auto-loading with onnx2oracle...")
 
     try:
-        model_bytes = _download_onnx_model(_ONNX_MODEL_URL)
-
-        # Fix dynamic axes for Oracle compatibility
-        print("Fixing ONNX model dimensions for Oracle compatibility...")
-        model_bytes = _fix_onnx_for_oracle(model_bytes)
+        model_bytes = _build_oracle_onnx_model(model_name)
+        metadata = _onnx_metadata_json()
     except ImportError as exc:
         raise OnnxModelLoadError(
-            "oracle_onnx embeddings require the ONNX optional dependency. "
+            "oracle_onnx embeddings require the onnx2oracle optional dependency. "
             "Install with `pip install -e '.[oracle-onnx]'`, or set "
             "ORAMEMVID_EMBEDDING_PROVIDER=ollama."
         ) from exc
-    except httpx.HTTPError as exc:
+    except OnnxModelLoadError:
+        raise
+    except Exception as exc:
         raise OnnxModelLoadError(
-            f"Could not download ONNX model from {_ONNX_MODEL_URL}. "
-            "Set ORAMEMVID_EMBEDDING_PROVIDER=ollama to skip in-database "
-            "embedding setup."
+            "Could not build an Oracle-compatible ONNX model with onnx2oracle. "
+            "Pre-load the model manually or set ORAMEMVID_EMBEDDING_PROVIDER=ollama."
         ) from exc
 
-    metadata = '{"function":"embedding","input":{"input":["DATA"]},"output":{"embedding":["DATA"]}}'
-
-    # Try BLOB-based loading (Oracle 23ai+)
     try:
-        model_blob = conn.createlob(oracledb.DB_TYPE_BLOB)
-        model_blob.write(model_bytes)
-
         cursor.execute("""
             BEGIN
                 DBMS_VECTOR.LOAD_ONNX_MODEL(
-                    :model_name,
-                    :model_data,
-                    JSON(:metadata)
+                    model_name => :model_name,
+                    model_data => :model_data,
+                    metadata   => JSON(:metadata)
                 );
             END;
         """, {
             "model_name": model_name,
-            "model_data": model_blob,
+            "model_data": model_bytes,
             "metadata": metadata,
         })
         conn.commit()
         print(f"ONNX model '{model_name}' loaded into Oracle successfully.")
-        return
 
     except oracledb.DatabaseError as e:
-        print(f"BLOB loading failed: {e}")
-
-    # Fallback: directory-based loading. This requires explicit admin
-    # credentials because granting directory access is a privileged operation.
-    if not settings.oracle_admin_user or not settings.oracle_admin_password:
         raise OnnxModelLoadError(
-            "BLOB-based ONNX loading failed, and directory-based loading "
-            "requires ORAMEMVID_ORACLE_ADMIN_USER and "
-            "ORAMEMVID_ORACLE_ADMIN_PASSWORD. Set those variables for Oracle "
-            "versions that require directory loading, pre-load the model "
-            "manually, or set ORAMEMVID_EMBEDDING_PROVIDER=ollama."
-        )
-
-    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
-        tmp.write(model_bytes)
-        tmp_path = tmp.name
-
-    try:
-        tmp_dir = os.path.dirname(tmp_path)
-        tmp_file = os.path.basename(tmp_path)
-        directory_name = _validate_db_identifier(
-            settings.onnx_directory_name,
-            "directory name",
-        )
-        schema_user = _validate_db_identifier(settings.oracle_user, "schema user")
-
-        sys_conn = None
-        try:
-            sys_conn = oracledb.connect(
-                user=settings.oracle_admin_user,
-                password=settings.oracle_admin_password,
-                dsn=settings.oracle_dsn,
-            )
-            sys_cursor = sys_conn.cursor()
-            sys_cursor.execute(
-                f"CREATE OR REPLACE DIRECTORY {directory_name} AS {_sql_string_literal(tmp_dir)}"
-            )
-            sys_cursor.execute(
-                f"GRANT READ ON DIRECTORY {directory_name} TO {schema_user}"
-            )
-            sys_conn.commit()
-        finally:
-            if sys_conn is not None:
-                sys_conn.close()
-
-        cursor.execute("""
-            BEGIN
-                DBMS_VECTOR.LOAD_ONNX_MODEL(
-                    :model_name,
-                    :directory_name || '/' || :filename,
-                    JSON(:metadata)
-                );
-            END;
-        """, {
-            "model_name": model_name,
-            "directory_name": directory_name,
-            "filename": tmp_file,
-            "metadata": metadata,
-        })
-        conn.commit()
-        print(f"ONNX model '{model_name}' loaded via directory successfully.")
-
-    except oracledb.DatabaseError as e2:
-        raise OnnxModelLoadError(
-            "Could not load the ONNX model through Oracle directory loading. "
+            "Could not load the onnx2oracle-built ONNX model with DBMS_VECTOR. "
             "Pre-load the model manually or set ORAMEMVID_EMBEDDING_PROVIDER=ollama."
-        ) from e2
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        ) from e
 
 
 if __name__ == "__main__":

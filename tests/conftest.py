@@ -5,6 +5,13 @@ from oramemvid.config import Settings
 _schema_initialized = False
 
 
+def _acquire_or_skip(db_pool):
+    try:
+        return db_pool.acquire()
+    except oracledb.Error as exc:
+        pytest.skip(f"Oracle DB unavailable: {exc}")
+
+
 @pytest.fixture(scope="session")
 def settings():
     return Settings()
@@ -28,7 +35,7 @@ def db_pool(settings):
 
 @pytest.fixture
 def db_conn(db_pool):
-    conn = db_pool.acquire()
+    conn = _acquire_or_skip(db_pool)
     yield conn
     conn.rollback()
     db_pool.release(conn)
@@ -49,9 +56,11 @@ def init_schema_for_oracle_tests(request):
 
     db_pool = request.getfixturevalue("db_pool")
     settings = request.getfixturevalue("settings")
+    conn = _acquire_or_skip(db_pool)
     try:
-        with db_pool.acquire() as conn:
-            init_schema(conn, settings)
+        init_schema(conn, settings)
     except OnnxModelLoadError as exc:
         pytest.skip(f"Oracle ONNX bootstrap unavailable: {exc}")
+    finally:
+        db_pool.release(conn)
     _schema_initialized = True

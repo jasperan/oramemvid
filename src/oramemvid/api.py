@@ -3,7 +3,7 @@
 import os
 import tempfile
 import zipfile
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import PurePosixPath
 
 from fastapi import FastAPI, HTTPException, Query, Request, UploadFile
@@ -40,6 +40,15 @@ def _get_conn():
 
 def _release_conn(conn):
     get_pool().release(conn)
+
+
+@contextmanager
+def _db_conn():
+    conn = _get_conn()
+    try:
+        yield conn
+    finally:
+        _release_conn(conn)
 
 
 def _validate_upload_suffix(filename: str | None) -> str:
@@ -235,6 +244,33 @@ def _search_filter_args(
     }
 
 
+def _run_filtered_search(
+    search_func,
+    query: str,
+    top_k: int,
+    time_from: str | None,
+    time_to: str | None,
+    tags: list[str] | None,
+    entity: str | None,
+    kind: str | None,
+    *extra_args,
+):
+    filter_args = _search_filter_args(tags, entity, kind)
+    with _db_conn() as conn:
+        try:
+            return search_func(
+                conn,
+                query,
+                *extra_args,
+                top_k=top_k,
+                time_from=time_from,
+                time_to=time_to,
+                **filter_args,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     pool = get_pool(settings)
@@ -278,8 +314,7 @@ class IngestTextRequest(BaseModel):
 
 @app.post("/ingest/text")
 def route_ingest_text(req: IngestTextRequest):
-    conn = _get_conn()
-    try:
+    with _db_conn() as conn:
         llm = llm_provider if req.extract_memories else None
         result = ingest_text(
             conn=conn,
@@ -292,8 +327,6 @@ def route_ingest_text(req: IngestTextRequest):
             chunk_overlap=settings.chunk_overlap,
         )
         return result
-    finally:
-        _release_conn(conn)
 
 
 @app.post("/ingest/file")
@@ -305,8 +338,7 @@ def route_ingest_file(
     tmp_path = _write_upload_to_temp(file, suffix, settings.max_upload_bytes)
     try:
         _validate_upload_content(tmp_path, suffix)
-        conn = _get_conn()
-        try:
+        with _db_conn() as conn:
             llm = llm_provider if extract_memories else None
             result = ingest_file(
                 conn=conn,
@@ -318,8 +350,6 @@ def route_ingest_file(
                 filename=file.filename,
             )
             return result
-        finally:
-            _release_conn(conn)
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -334,35 +364,26 @@ def route_list_frames(
     offset: int = Query(0, ge=0),
     doc_id: int | None = Query(None),
 ):
-    conn = _get_conn()
-    try:
+    with _db_conn() as conn:
         return list_frames(conn, limit=limit, offset=offset, doc_id=doc_id)
-    finally:
-        _release_conn(conn)
 
 
 @app.get("/frames/{frame_id}")
 def route_get_frame(frame_id: int):
-    conn = _get_conn()
-    try:
+    with _db_conn() as conn:
         frame = get_frame(conn, frame_id)
         if frame is None:
             raise HTTPException(status_code=404, detail="Frame not found")
         return frame
-    finally:
-        _release_conn(conn)
 
 
 @app.delete("/frames/{frame_id}")
 def route_delete_frame(frame_id: int):
-    conn = _get_conn()
-    try:
+    with _db_conn() as conn:
         deleted = delete_frame(conn, frame_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="Frame not found")
         return {"deleted": True}
-    finally:
-        _release_conn(conn)
 
 
 # --- Search routes ---
@@ -379,31 +400,19 @@ def route_search(
     entity: str | None = Query(None),
     kind: str | None = Query(None),
 ):
-    filter_args = _search_filter_args(tags, entity, kind)
-    conn = _get_conn()
-    try:
-        try:
-            if mode == "text":
-                return search_text(
-                    conn, query, top_k=top_k, time_from=time_from, time_to=time_to,
-                    **filter_args,
-                )
-            elif mode == "vector":
-                return search_vector(
-                    conn, query, embedding_provider, top_k=top_k,
-                    time_from=time_from, time_to=time_to,
-                    **filter_args,
-                )
-            else:
-                return search_hybrid(
-                    conn, query, embedding_provider, top_k=top_k,
-                    time_from=time_from, time_to=time_to,
-                    **filter_args,
-                )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-    finally:
-        _release_conn(conn)
+    if mode == "text":
+        return _run_filtered_search(
+            search_text, query, top_k, time_from, time_to, tags, entity, kind,
+        )
+    if mode == "vector":
+        return _run_filtered_search(
+            search_vector, query, top_k, time_from, time_to, tags, entity, kind,
+            embedding_provider,
+        )
+    return _run_filtered_search(
+        search_hybrid, query, top_k, time_from, time_to, tags, entity, kind,
+        embedding_provider,
+    )
 
 
 @app.get("/search/text")
@@ -416,18 +425,9 @@ def route_search_text(
     entity: str | None = Query(None),
     kind: str | None = Query(None),
 ):
-    filter_args = _search_filter_args(tags, entity, kind)
-    conn = _get_conn()
-    try:
-        try:
-            return search_text(
-                conn, query, top_k=top_k, time_from=time_from, time_to=time_to,
-                **filter_args,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-    finally:
-        _release_conn(conn)
+    return _run_filtered_search(
+        search_text, query, top_k, time_from, time_to, tags, entity, kind,
+    )
 
 
 @app.get("/search/vector")
@@ -440,19 +440,10 @@ def route_search_vector(
     entity: str | None = Query(None),
     kind: str | None = Query(None),
 ):
-    filter_args = _search_filter_args(tags, entity, kind)
-    conn = _get_conn()
-    try:
-        try:
-            return search_vector(
-                conn, query, embedding_provider, top_k=top_k,
-                time_from=time_from, time_to=time_to,
-                **filter_args,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-    finally:
-        _release_conn(conn)
+    return _run_filtered_search(
+        search_vector, query, top_k, time_from, time_to, tags, entity, kind,
+        embedding_provider,
+    )
 
 
 # --- Memory card routes ---
@@ -466,32 +457,25 @@ def route_list_memory_cards(
     limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ):
-    conn = _get_conn()
-    try:
+    with _db_conn() as conn:
         return list_memory_cards(
             conn, entity=entity, kind=kind,
             source_frame_id=source_frame_id, limit=limit, offset=offset,
         )
-    finally:
-        _release_conn(conn)
 
 
 @app.get("/memory/{card_id}")
 def route_get_memory_card(card_id: int):
-    conn = _get_conn()
-    try:
+    with _db_conn() as conn:
         card = get_memory_card(conn, card_id)
         if card is None:
             raise HTTPException(status_code=404, detail="Memory card not found")
         return card
-    finally:
-        _release_conn(conn)
 
 
 @app.post("/memory/extract/{frame_id}")
 def route_extract_memories(frame_id: int):
-    conn = _get_conn()
-    try:
+    with _db_conn() as conn:
         frame = get_frame(conn, frame_id)
         if frame is None:
             raise HTTPException(status_code=404, detail="Frame not found")
@@ -510,20 +494,15 @@ def route_extract_memories(frame_id: int):
             )
             card_ids.append(card_id)
         return {"frame_id": frame_id, "cards_created": len(card_ids), "card_ids": card_ids}
-    finally:
-        _release_conn(conn)
 
 
 @app.delete("/memory/{card_id}")
 def route_delete_memory_card(card_id: int):
-    conn = _get_conn()
-    try:
+    with _db_conn() as conn:
         deleted = delete_memory_card(conn, card_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="Memory card not found")
         return {"deleted": True}
-    finally:
-        _release_conn(conn)
 
 
 # --- Document routes ---
@@ -534,8 +513,7 @@ def route_list_documents(
     limit: int = Query(20, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ):
-    conn = _get_conn()
-    try:
+    with _db_conn() as conn:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT doc_id, filename, doc_type, file_hash, total_frames, ingested_at
@@ -551,8 +529,6 @@ def route_list_documents(
             }
             for r in cursor.fetchall()
         ]
-    finally:
-        _release_conn(conn)
 
 
 # --- Stats ---
@@ -560,8 +536,7 @@ def route_list_documents(
 
 @app.get("/stats")
 def route_stats():
-    conn = _get_conn()
-    try:
+    with _db_conn() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM frames")
         frame_count = cursor.fetchone()[0]
@@ -574,8 +549,6 @@ def route_stats():
             "card_count": card_count,
             "document_count": document_count,
         }
-    finally:
-        _release_conn(conn)
 
 
 # --- Health ---
@@ -584,13 +557,10 @@ def route_stats():
 @app.get("/health")
 def route_health():
     try:
-        conn = _get_conn()
-        try:
+        with _db_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT 1 FROM dual")
             cursor.fetchone()
             return {"status": "ok", "database": "connected"}
-        finally:
-            _release_conn(conn)
     except Exception as exc:
         return {"status": "degraded", "database": str(exc)}

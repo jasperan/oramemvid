@@ -230,3 +230,27 @@ def test_search_tag_parse_error_rejects_before_db_connection(monkeypatch):
         api.route_search(query="Oracle", tags=["missing_equals"])
 
     assert exc_info.value.status_code == 400
+
+
+def test_search_error_releases_db_connection(monkeypatch):
+    conn = object()
+    released = []
+
+    monkeypatch.setattr(api, "_get_conn", lambda: conn)
+    monkeypatch.setattr(api, "_release_conn", released.append)
+
+    def fail_search(conn_arg, *_args, **_kwargs):
+        assert conn_arg is conn
+        raise ValueError("invalid filter")
+
+    monkeypatch.setattr(api, "search_text", fail_search)
+
+    with pytest.raises(HTTPException) as exc_info:
+        api.route_search(
+            query="Oracle", mode="text", top_k=10,
+            tags=None, entity=None, kind=None,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "invalid filter"
+    assert released == [conn]
