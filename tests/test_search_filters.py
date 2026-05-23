@@ -1,11 +1,14 @@
 from datetime import datetime
 
+import oracledb
 import pytest
 
 from oramemvid.search import (
+    SearchCapabilityError,
     _build_filters,
     _parse_time_bound,
     _sanitize_text_query,
+    search_text,
 )
 
 
@@ -59,3 +62,54 @@ def test_build_filters_rejects_invalid_tag_key():
 def test_build_filters_rejects_invalid_memory_kind():
     with pytest.raises(ValueError, match="Invalid kind"):
         _build_filters(kind="Unknown")
+
+
+class _TextSearchCursor:
+    def __init__(self, *, fail_contains: bool = False):
+        self.fail_contains = fail_contains
+        self.calls: list[str] = []
+        self.rows = [
+            (1, "mem://one", "One", "Oracle text", "hash", datetime(2026, 5, 1), 1)
+        ]
+
+    def execute(self, sql, params=None):
+        self.calls.append(sql)
+        if self.fail_contains and "CONTAINS" in sql:
+            raise oracledb.DatabaseError("Oracle Text unavailable")
+
+    def fetchall(self):
+        return self.rows
+
+
+class _TextSearchConn:
+    def __init__(self, cursor):
+        self.cursor_obj = cursor
+
+    def cursor(self):
+        return self.cursor_obj
+
+
+def test_search_text_auto_uses_named_degraded_lob_fallback():
+    cursor = _TextSearchCursor(fail_contains=True)
+
+    results = search_text(_TextSearchConn(cursor), "Oracle", mode="auto")
+
+    assert results[0]["frame_id"] == 1
+    assert any("CONTAINS" in sql for sql in cursor.calls)
+    assert any("DBMS_LOB.INSTR" in sql for sql in cursor.calls)
+
+
+def test_search_text_strict_mode_raises_when_oracle_text_fails():
+    cursor = _TextSearchCursor(fail_contains=True)
+
+    with pytest.raises(SearchCapabilityError):
+        search_text(_TextSearchConn(cursor), "Oracle", mode="oracle_text")
+
+
+def test_search_text_degraded_mode_skips_oracle_text():
+    cursor = _TextSearchCursor(fail_contains=True)
+
+    search_text(_TextSearchConn(cursor), "Oracle", mode="degraded_lob")
+
+    assert not any("CONTAINS" in sql for sql in cursor.calls)
+    assert any("DBMS_LOB.INSTR" in sql for sql in cursor.calls)

@@ -12,6 +12,11 @@ _TEXT_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 _TAG_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _ORACLE_TEXT_TOKEN_LIMIT = 32
 _ORACLE_TEXT_OPERATORS = {"AND", "OR", "NOT", "ACCUM", "NEAR", "WITHIN"}
+TEXT_SEARCH_MODES = {"auto", "oracle_text", "degraded_lob"}
+
+
+class SearchCapabilityError(RuntimeError):
+    """Raised when a requested non-degraded search capability is unavailable."""
 
 
 def _read_content(val):
@@ -108,17 +113,23 @@ def search_text(
     tags: dict[str, Any] | None = None,
     entity: str | None = None,
     kind: str | None = None,
+    mode: str = "auto",
 ) -> list[dict]:
+    if mode not in TEXT_SEARCH_MODES:
+        raise ValueError(f"Invalid text search mode: {mode}")
     cursor = conn.cursor()
     safe_query = _sanitize_text_query(query)
+    if mode == "degraded_lob":
+        safe_query = ""
     filter_sql, filter_params = _build_filters(
         time_from=time_from, time_to=time_to, tags=tags,
         entity=entity, kind=kind,
     )
     params: dict = {"query": safe_query, "top_k": top_k, **filter_params}
 
-    # Try Oracle Text CONTAINS first
-    if safe_query:
+    # Try Oracle Text CONTAINS first unless the caller explicitly selected
+    # the degraded CLOB-safe fallback.
+    if safe_query and mode != "degraded_lob":
         try:
             cursor.execute(f"""
                 SELECT f.frame_id, f.uri, f.title, f.content, f.content_hash, f.created_at,
@@ -128,8 +139,26 @@ def search_text(
                 ORDER BY relevance DESC
                 FETCH FIRST :top_k ROWS ONLY
             """, params)
-        except oracledb.DatabaseError:
+        except oracledb.DatabaseError as exc:
+            if mode == "oracle_text":
+                raise SearchCapabilityError(
+                    "Oracle Text search is required but CONTAINS failed."
+                ) from exc
             safe_query = ""
+        else:
+            return [
+                {
+                    "frame_id": r[0], "uri": r[1], "title": r[2],
+                    "content": _read_content(r[3]), "content_hash": r[4],
+                    "created_at": r[5].isoformat() if r[5] else None,
+                    "score": float(r[6]),
+                }
+                for r in cursor.fetchall()
+            ]
+
+    if mode == "oracle_text":
+        if not safe_query:
+            return []
 
     if not safe_query:
         # Fallback to DBMS_LOB.INSTR for CLOB-safe text search

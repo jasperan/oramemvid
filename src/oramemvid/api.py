@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from oramemvid.config import get_settings
-from oramemvid.db import get_pool, close_pool, init_schema
+from oramemvid.db import get_pool, close_pool, init_schema, get_capabilities
 from oramemvid.embeddings import get_embedding_provider
 from oramemvid.frames import get_frame, list_frames, delete_frame
 from oramemvid.ingest import ingest_file, ingest_text
@@ -22,7 +22,7 @@ from oramemvid.memory_cards import (
     list_memory_cards,
     delete_memory_card,
 )
-from oramemvid.search import search_text, search_vector, search_hybrid
+from oramemvid.search import SearchCapabilityError, search_text, search_vector, search_hybrid
 
 settings = get_settings()
 embedding_provider = get_embedding_provider(settings)
@@ -269,6 +269,8 @@ def _run_filtered_search(
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SearchCapabilityError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @asynccontextmanager
@@ -561,6 +563,11 @@ def route_health():
             cursor = conn.cursor()
             cursor.execute("SELECT 1 FROM dual")
             cursor.fetchone()
-            return {"status": "ok", "database": "connected"}
+            capabilities = get_capabilities()
+            return {
+                "status": "degraded" if capabilities.degraded else "ok",
+                "database": "connected",
+                "capabilities": capabilities.as_dict(),
+            }
     except Exception as exc:
         return {"status": "degraded", "database": str(exc)}

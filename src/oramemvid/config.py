@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     chunk_overlap: int = 50
     max_upload_bytes: int = 50 * 1024 * 1024
     allowed_upload_extensions: str = ".txt,.pdf,.docx,.xlsx,.pptx"
+    require_oracle_text: bool = False
+    require_vector_index: bool = False
 
     model_config = {"env_prefix": "ORAMEMVID_", "env_file": ".env"}
 

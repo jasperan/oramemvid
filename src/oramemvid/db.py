@@ -1,4 +1,5 @@
 import re
+from dataclasses import dataclass, field
 
 import oracledb
 from oramemvid.config import Settings
@@ -13,6 +14,26 @@ _DB_IDENTIFIER_RE = re.compile(r"^[A-Z][A-Z0-9_$#]*$")
 # SYSTEM tablespace uses manual segment space management, so we
 # target an ASSM-enabled tablespace instead.
 _TABLESPACE = "PYTHIA_DATA"
+_capabilities: "DatabaseCapabilities | None" = None
+
+
+@dataclass(frozen=True)
+class DatabaseCapabilities:
+    oracle_text: bool = False
+    vector_index: bool = False
+    degraded_reasons: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def degraded(self) -> bool:
+        return bool(self.degraded_reasons)
+
+    def as_dict(self) -> dict:
+        return {
+            "oracle_text": self.oracle_text,
+            "vector_index": self.vector_index,
+            "degraded": self.degraded,
+            "degraded_reasons": dict(self.degraded_reasons),
+        }
 
 
 class OnnxModelLoadError(RuntimeError):
@@ -48,10 +69,24 @@ def close_pool():
         _pool = None
 
 
+def get_capabilities() -> DatabaseCapabilities:
+    return _capabilities or DatabaseCapabilities(
+        degraded_reasons={"schema": "Schema has not been initialized in this process."}
+    )
+
+
 def _table_exists(cursor, table_name: str) -> bool:
     cursor.execute(
         "SELECT COUNT(*) FROM user_tables WHERE table_name = :name",
         {"name": table_name.upper()},
+    )
+    return cursor.fetchone()[0] > 0
+
+
+def _index_exists(cursor, index_name: str) -> bool:
+    cursor.execute(
+        "SELECT COUNT(*) FROM user_indexes WHERE index_name = :name",
+        {"name": index_name.upper()},
     )
     return cursor.fetchone()[0] > 0
 
@@ -86,6 +121,7 @@ def _detect_tablespace(cursor) -> str:
 
 
 def init_schema(conn: oracledb.Connection, settings: Settings | None = None):
+    global _capabilities
     global _TABLESPACE
     cursor = conn.cursor()
     _TABLESPACE = _detect_tablespace(cursor)
@@ -110,6 +146,9 @@ def init_schema(conn: oracledb.Connection, settings: Settings | None = None):
             "INSERT INTO schema_version (version) VALUES (1)"
         )
 
+    capability_reasons = _ensure_optional_indexes(cursor)
+    _capabilities = _detect_capabilities(cursor, capability_reasons)
+
     conn.commit()
 
     # Auto-load ONNX embedding model if configured for in-database embeddings.
@@ -123,6 +162,8 @@ def init_schema(conn: oracledb.Connection, settings: Settings | None = None):
             _validate_db_identifier(settings.onnx_model_name, "model name"),
             settings,
         )
+
+    _enforce_required_capabilities(_capabilities, settings)
 
 
 def _apply_v1(cursor):
@@ -159,25 +200,6 @@ def _apply_v1(cursor):
             ) TABLESPACE {ts}
         """)
 
-        # Oracle Text index for full-text search
-        try:
-            cursor.execute("""
-                CREATE INDEX frames_content_idx ON frames(content)
-                    INDEXTYPE IS CTXSYS.CONTEXT
-                    PARAMETERS ('SYNC (ON COMMIT)')
-            """)
-        except oracledb.DatabaseError:
-            pass  # Oracle Text not available, text search will use LIKE fallback
-
-        # Vector index for similarity search
-        try:
-            cursor.execute("""
-                CREATE VECTOR INDEX frames_vec_idx ON frames(embedding)
-                    ORGANIZATION INMEMORY NEIGHBOR GRAPH
-            """)
-        except oracledb.DatabaseError:
-            pass  # vector index not supported, vector search will do exact scan
-
     if not _table_exists(cursor, "MEMORY_CARDS"):
         cursor.execute(f"""
             CREATE TABLE memory_cards (
@@ -195,6 +217,68 @@ def _apply_v1(cursor):
                 )
             ) TABLESPACE {ts}
         """)
+
+
+def _ensure_optional_indexes(cursor) -> dict[str, str]:
+    reasons: dict[str, str] = {}
+    if _table_exists(cursor, "FRAMES") and not _index_exists(cursor, "FRAMES_CONTENT_IDX"):
+        try:
+            cursor.execute("""
+                CREATE INDEX frames_content_idx ON frames(content)
+                    INDEXTYPE IS CTXSYS.CONTEXT
+                    PARAMETERS ('SYNC (ON COMMIT)')
+            """)
+        except oracledb.DatabaseError as exc:
+            reasons["oracle_text"] = (
+                f"Oracle Text index FRAMES_CONTENT_IDX unavailable: {exc}"
+            )
+
+    if _table_exists(cursor, "FRAMES") and not _index_exists(cursor, "FRAMES_VEC_IDX"):
+        try:
+            cursor.execute("""
+                CREATE VECTOR INDEX frames_vec_idx ON frames(embedding)
+                    ORGANIZATION INMEMORY NEIGHBOR GRAPH
+            """)
+        except oracledb.DatabaseError as exc:
+            reasons["vector_index"] = (
+                f"Vector index FRAMES_VEC_IDX unavailable: {exc}"
+            )
+    return reasons
+
+
+def _detect_capabilities(cursor, reasons: dict[str, str] | None = None) -> DatabaseCapabilities:
+    reasons = dict(reasons or {})
+    oracle_text = _index_exists(cursor, "FRAMES_CONTENT_IDX")
+    vector_index = _index_exists(cursor, "FRAMES_VEC_IDX")
+    if not oracle_text:
+        reasons.setdefault(
+            "oracle_text",
+            "Oracle Text index FRAMES_CONTENT_IDX is not present; "
+            "text search will use degraded DBMS_LOB.INSTR mode.",
+        )
+    if not vector_index:
+        reasons.setdefault(
+            "vector_index",
+            "Vector index FRAMES_VEC_IDX is not present; vector search will use exact scan.",
+        )
+    return DatabaseCapabilities(
+        oracle_text=oracle_text,
+        vector_index=vector_index,
+        degraded_reasons=reasons,
+    )
+
+
+def _enforce_required_capabilities(
+    capabilities: DatabaseCapabilities,
+    settings: Settings,
+) -> None:
+    missing = []
+    if settings.require_oracle_text and not capabilities.oracle_text:
+        missing.append(capabilities.degraded_reasons.get("oracle_text", "Oracle Text unavailable"))
+    if settings.require_vector_index and not capabilities.vector_index:
+        missing.append(capabilities.degraded_reasons.get("vector_index", "Vector index unavailable"))
+    if missing:
+        raise RuntimeError("Required Oracle capabilities are unavailable: " + "; ".join(missing))
 
 
 def _onnx_model_exists(cursor, model_name: str) -> bool:

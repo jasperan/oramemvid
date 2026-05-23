@@ -5,7 +5,14 @@ import oracledb
 import pytest
 
 from oramemvid.config import Settings
-from oramemvid.db import OnnxModelLoadError, _ensure_onnx_model, _onnx2oracle_spec
+from oramemvid.db import (
+    DatabaseCapabilities,
+    OnnxModelLoadError,
+    _detect_capabilities,
+    _enforce_required_capabilities,
+    _ensure_onnx_model,
+    _onnx2oracle_spec,
+)
 
 
 class _FakeVar:
@@ -89,3 +96,36 @@ def test_onnx_bootstrap_reports_oracle_load_errors(monkeypatch):
 
     with pytest.raises(OnnxModelLoadError, match="onnx2oracle-built ONNX model"):
         _ensure_onnx_model(_FakeConnection(fail_load=True), "ALL_MINILM_L6_V2", settings)
+
+
+class _CapabilityCursor:
+    def __init__(self, indexes: set[str]):
+        self.indexes = indexes
+        self._count = 0
+
+    def execute(self, _sql, params=None):
+        self._count = int((params or {}).get("name", "") in self.indexes)
+
+    def fetchone(self):
+        return [self._count]
+
+
+def test_detect_capabilities_reports_missing_indexes():
+    capabilities = _detect_capabilities(_CapabilityCursor(set()))
+
+    assert not capabilities.oracle_text
+    assert not capabilities.vector_index
+    assert "oracle_text" in capabilities.degraded_reasons
+    assert "vector_index" in capabilities.degraded_reasons
+
+
+def test_enforce_required_capabilities_fails_explicitly():
+    capabilities = DatabaseCapabilities(
+        oracle_text=False,
+        vector_index=True,
+        degraded_reasons={"oracle_text": "missing text index"},
+    )
+    settings = Settings(oracle_password="test", require_oracle_text=True)
+
+    with pytest.raises(RuntimeError, match="missing text index"):
+        _enforce_required_capabilities(capabilities, settings)
