@@ -19,21 +19,18 @@ Replaces memvid's custom `.mv2` binary format with Oracle AI Vector Search, Orac
 # Start Oracle 26ai Free (if using Docker)
 docker compose up -d
 
-# Create conda env
-conda create -n oramemvid python=3.12 -y
-conda activate oramemvid
-
-# Install. The oracle-onnx extra supports the default embedding provider.
-pip install -e ".[dev,oracle-onnx]"
+# Install dependencies into a managed virtualenv.
+# The oracle-onnx extra supports the default embedding provider.
+uv sync --extra dev --extra oracle-onnx
 
 # Copy and edit .env
 cp .env.example .env
 
 # Initialize schema
-python -m oramemvid.db
+uv run python -m oramemvid.db
 
 # Run API
-uvicorn oramemvid.api:app --reload --port 8000
+uv run uvicorn oramemvid.api:app --reload --port 8000
 ```
 
 ## API Examples
@@ -92,7 +89,7 @@ All settings via environment variables with `ORAMEMVID_` prefix:
 ## Testing
 
 ```bash
-pytest tests/ -v
+uv run pytest tests/ -v
 ```
 
 Pure unit tests run without Oracle. Tests that use `db_conn`, `db_pool`, or

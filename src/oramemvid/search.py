@@ -156,9 +156,8 @@ def search_text(
                 for r in cursor.fetchall()
             ]
 
-    if mode == "oracle_text":
-        if not safe_query:
-            return []
+    if mode == "oracle_text" and not safe_query:
+        return []
 
     if not safe_query:
         # Fallback to DBMS_LOB.INSTR for CLOB-safe text search

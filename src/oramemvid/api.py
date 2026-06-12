@@ -17,7 +17,7 @@ from oramemvid.frames import get_frame, list_frames, delete_frame
 from oramemvid.ingest import ingest_file, ingest_text
 from oramemvid.llm import get_llm_provider
 from oramemvid.memory_cards import (
-    create_memory_card,
+    create_cards_from_llm,
     get_memory_card,
     list_memory_cards,
     delete_memory_card,
@@ -482,19 +482,9 @@ def route_extract_memories(frame_id: int):
         if frame is None:
             raise HTTPException(status_code=404, detail="Frame not found")
 
-        cards = llm_provider.extract_memories(frame["content"])
-        card_ids = []
-        for card in cards:
-            card_id = create_memory_card(
-                conn=conn,
-                entity=card.get("entity", "unknown"),
-                slot=card.get("slot", "unknown"),
-                value=card.get("value", ""),
-                kind=card.get("kind", "Fact"),
-                source_frame_id=frame_id,
-                confidence=card.get("confidence", 1.0),
-            )
-            card_ids.append(card_id)
+        card_ids = create_cards_from_llm(
+            conn, llm_provider, frame["content"], frame_id,
+        )
         return {"frame_id": frame_id, "cards_created": len(card_ids), "card_ids": card_ids}
 
 

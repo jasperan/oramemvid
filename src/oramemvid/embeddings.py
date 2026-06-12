@@ -1,18 +1,9 @@
-import re
 from abc import ABC, abstractmethod
 
 import httpx
 
 from oramemvid.config import Settings
-
-_DB_IDENTIFIER_RE = re.compile(r"^[A-Z][A-Z0-9_$#]*$")
-
-
-def _validate_db_identifier(value: str, label: str) -> str:
-    value = value.upper()
-    if not _DB_IDENTIFIER_RE.fullmatch(value):
-        raise ValueError(f"Invalid Oracle {label}: {value!r}")
-    return value
+from oramemvid.db import _validate_db_identifier
 
 
 class EmbeddingProvider(ABC):
@@ -23,10 +14,6 @@ class EmbeddingProvider(ABC):
 
     @abstractmethod
     def embed(self, text: str) -> list[float]:
-        ...
-
-    @abstractmethod
-    def embed_batch(self, texts: list[str]) -> list[list[float]]:
         ...
 
 
@@ -48,12 +35,6 @@ class OracleONNXEmbedding(EmbeddingProvider):
         return f"VECTOR_EMBEDDING({self.model_name} USING {bind_var} AS data)"
 
     def embed(self, text: str) -> list[float]:
-        raise NotImplementedError(
-            "OracleONNXEmbedding computes embeddings in SQL. "
-            "Use sql_fragment() in your INSERT/SELECT statement."
-        )
-
-    def embed_batch(self, texts: list[str]) -> list[list[float]]:
         raise NotImplementedError(
             "OracleONNXEmbedding computes embeddings in SQL. "
             "Use sql_fragment() in your INSERT/SELECT statement."

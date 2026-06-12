@@ -29,6 +29,40 @@ def create_memory_card(
     return int(card_id_var.getvalue()[0])
 
 
+def create_cards_from_llm(
+    conn: oracledb.Connection,
+    llm,
+    content: str,
+    frame_id: int | None,
+    *,
+    commit: bool = True,
+) -> list[int]:
+    """Extract memory cards from text via the LLM and persist them.
+
+    Applies the defaulting policy for untrusted LLM output in one place.
+    Returns the ids of the created cards. When ``commit`` is False the caller
+    owns the transaction (used by the atomic ingest pipeline).
+    """
+    if llm is None:
+        return []
+    card_ids: list[int] = []
+    for card in llm.extract_memories(content):
+        card_id = create_memory_card(
+            conn=conn,
+            entity=card.get("entity", "unknown"),
+            slot=card.get("slot", "unknown"),
+            value=card.get("value", ""),
+            kind=card.get("kind", "Fact"),
+            source_frame_id=frame_id,
+            confidence=card.get("confidence", 1.0),
+            commit=False,
+        )
+        card_ids.append(card_id)
+    if commit:
+        conn.commit()
+    return card_ids
+
+
 def get_memory_card(conn: oracledb.Connection, card_id: int) -> dict | None:
     cursor = conn.cursor()
     cursor.execute("""

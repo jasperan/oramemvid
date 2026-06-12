@@ -1,3 +1,4 @@
+import logging
 import re
 from dataclasses import dataclass, field
 
@@ -9,12 +10,9 @@ EMBEDDING_DIMS = 384
 
 _pool: oracledb.ConnectionPool | None = None
 _DB_IDENTIFIER_RE = re.compile(r"^[A-Z][A-Z0-9_$#]*$")
-
-# Tablespace with ASSM required for VECTOR and JSON types.
-# SYSTEM tablespace uses manual segment space management, so we
-# target an ASSM-enabled tablespace instead.
-_TABLESPACE = "PYTHIA_DATA"
 _capabilities: "DatabaseCapabilities | None" = None
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -122,16 +120,15 @@ def _detect_tablespace(cursor) -> str:
 
 def init_schema(conn: oracledb.Connection, settings: Settings | None = None):
     global _capabilities
-    global _TABLESPACE
     cursor = conn.cursor()
-    _TABLESPACE = _detect_tablespace(cursor)
+    tablespace = _detect_tablespace(cursor)
 
     if not _table_exists(cursor, "SCHEMA_VERSION"):
         cursor.execute(f"""
             CREATE TABLE schema_version (
                 version    NUMBER PRIMARY KEY,
                 applied_at TIMESTAMP DEFAULT SYSTIMESTAMP
-            ) TABLESPACE {_TABLESPACE}
+            ) TABLESPACE {tablespace}
         """)
 
     cursor.execute(
@@ -141,7 +138,7 @@ def init_schema(conn: oracledb.Connection, settings: Settings | None = None):
     current = row[0] if row[0] is not None else 0
 
     if current < 1:
-        _apply_v1(cursor)
+        _apply_v1(cursor, tablespace)
         cursor.execute(
             "INSERT INTO schema_version (version) VALUES (1)"
         )
@@ -166,9 +163,7 @@ def init_schema(conn: oracledb.Connection, settings: Settings | None = None):
     _enforce_required_capabilities(_capabilities, settings)
 
 
-def _apply_v1(cursor):
-    ts = _TABLESPACE
-
+def _apply_v1(cursor, ts: str):
     # documents first (referenced by frames)
     if not _table_exists(cursor, "DOCUMENTS"):
         cursor.execute(f"""
@@ -338,7 +333,7 @@ def _ensure_onnx_model(
     if _onnx_model_exists(cursor, model_name):
         return
 
-    print(f"ONNX model '{model_name}' not found in Oracle. Auto-loading with onnx2oracle...")
+    logger.info("ONNX model '%s' not found in Oracle. Auto-loading with onnx2oracle...", model_name)
 
     try:
         model_bytes = _build_oracle_onnx_model(model_name)
@@ -372,7 +367,7 @@ def _ensure_onnx_model(
             "metadata": metadata,
         })
         conn.commit()
-        print(f"ONNX model '{model_name}' loaded into Oracle successfully.")
+        logger.info("ONNX model '%s' loaded into Oracle successfully.", model_name)
 
     except oracledb.DatabaseError as e:
         raise OnnxModelLoadError(
