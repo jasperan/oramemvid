@@ -87,6 +87,7 @@ def list_memory_cards(
     conn: oracledb.Connection, entity: str | None = None,
     kind: str | None = None, source_frame_id: int | None = None,
     limit: int = 50, offset: int = 0,
+    include_expired: bool = True,
 ) -> list[dict]:
     conditions = []
     params: dict = {"off": offset, "lim": limit}
@@ -99,11 +100,13 @@ def list_memory_cards(
     if source_frame_id is not None:
         conditions.append("source_frame_id = :frame_id")
         params["frame_id"] = source_frame_id
+    if not include_expired:
+        conditions.append("(expires_at IS NULL OR expires_at > SYSTIMESTAMP)")
     where = "WHERE " + " AND ".join(conditions) if conditions else ""
     cursor = conn.cursor()
     cursor.execute(f"""
         SELECT card_id, entity, slot, card_value, kind,
-               source_frame_id, confidence, created_at
+               source_frame_id, confidence, created_at, expires_at
         FROM memory_cards {where}
         ORDER BY card_id
         OFFSET :off ROWS FETCH NEXT :lim ROWS ONLY
@@ -115,9 +118,38 @@ def list_memory_cards(
             "kind": r[4], "source_frame_id": r[5],
             "confidence": float(r[6]) if r[6] is not None else None,
             "created_at": r[7].isoformat() if r[7] else None,
+            "expires_at": r[8].isoformat() if r[8] else None,
         }
         for r in cursor.fetchall()
     ]
+
+
+def count_memory_cards(
+    conn: oracledb.Connection,
+    entity: str | None = None,
+    include_expired: bool = True,
+) -> int:
+    """Count memory cards, optionally excluding expired ones."""
+    conditions = []
+    params: dict = {}
+    if entity is not None:
+        conditions.append("entity = :entity")
+        params["entity"] = entity
+    if not include_expired:
+        conditions.append("(expires_at IS NULL OR expires_at > SYSTIMESTAMP)")
+    where = "WHERE " + " AND ".join(conditions) if conditions else ""
+    cursor = conn.cursor()
+    cursor.execute(f"SELECT COUNT(*) FROM memory_cards {where}", params)
+    return int(cursor.fetchone()[0])
+
+
+def delete_expired_cards(conn: oracledb.Connection) -> int:
+    """Delete all expired memory cards, returning the number removed."""
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM memory_cards WHERE expires_at IS NOT NULL AND expires_at <= SYSTIMESTAMP")
+    deleted = cursor.rowcount
+    conn.commit()
+    return deleted
 
 
 def delete_memory_card(conn: oracledb.Connection, card_id: int) -> bool:

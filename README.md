@@ -12,6 +12,9 @@ Replaces memvid's custom `.mv2` binary format with Oracle AI Vector Search, Orac
 - **In-database embeddings**: ONNX model runs inside Oracle via `VECTOR_EMBEDDING()`
 - **Document ingestion**: PDF, DOCX, XLSX, PPTX, TXT
 - **REST API**: FastAPI with full CRUD and search endpoints
+- **MCP server**: native agent memory backend over the Model Context Protocol (stdio)
+- **Entity memory profiles**: consolidated, confidence-ranked "what do I know about X?" recall
+  with contradiction detection and temporal-memory (expiry-aware) hygiene
 
 ## Quick Start
 
@@ -41,6 +44,12 @@ curl -X POST http://localhost:8000/ingest/text \
   -H "Content-Type: application/json" \
   -d '{"text": "Oracle supports vector embeddings natively.", "uri": "test://example"}'
 
+# Entity memory profile (recall: what do I know about X?)
+curl "http://localhost:8000/memory/profile?entity=Oracle"
+
+# Delete expired memory cards (temporal hygiene)
+curl -X DELETE http://localhost:8000/memory/expired
+
 # Upload a PDF
 curl -X POST http://localhost:8000/ingest/file \
   -F "file=@document.pdf" \
@@ -55,6 +64,56 @@ curl "http://localhost:8000/memory?entity=Oracle"
 # Health check
 curl http://localhost:8000/health
 ```
+
+## MCP Server
+
+oramemvid ships as a Model Context Protocol server so any MCP-capable agent
+(Claude, Codex, Cursor, ...) can use it as a native memory backend:
+
+```bash
+uv sync --extra mcp
+uv run oramemvid-mcp
+```
+
+Tools exposed over stdio:
+
+| Tool | Purpose |
+|------|---------|
+| `ingest_text` | store a text snippet as frames (optional LLM memory extraction) |
+| `search` | hybrid/text/vector frame search with filters |
+| `remember` | store a structured memory card |
+| `recall_entity` | consolidated entity profile (cards + contradictions + sources) |
+| `list_memory_cards` / `get_memory_card` | card queries |
+| `list_frames` / `get_frame` | frame queries |
+| `delete_expired_cards` | temporal-memory hygiene |
+| `health` | DB connectivity + Oracle capabilities |
+
+The server bootstraps the schema (and in-database ONNX model) on startup, the
+same way the REST API lifespan does. Point any MCP client at it, for example:
+
+```json
+{
+  "mcpServers": {
+    "oramemvid": {
+      "command": "uv",
+      "args": ["--directory", "/path/to/oramemvid", "run", "oramemvid-mcp"]
+    }
+  }
+}
+```
+
+## Entity Memory Profiles
+
+`GET /memory/profile?entity=X` (and the MCP `recall_entity` tool) consolidate
+all structured cards about an entity:
+
+- cards grouped by slot, values ranked by confidence (descending)
+- **contradiction detection**: a slot is flagged when it holds two confident,
+  distinct values (e.g. hometown = "London" vs "Venice")
+- backing source frames listed (up to 10)
+- expired cards excluded by default (`include_expired=true` to include them)
+
+`DELETE /memory/expired` removes cards whose `expires_at` has passed.
 
 ## Architecture
 

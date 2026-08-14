@@ -56,7 +56,9 @@ Run a single module: `pytest tests/test_search.py -v`
 - `db.py` — connection pool, schema init, ONNX model auto-load
 - `embeddings.py` — pluggable: `OracleONNXEmbedding` (default), `OllamaEmbedding`, `SentenceTransformerEmbedding`
 - `frames.py` — frame CRUD (content chunks with embeddings)
-- `memory_cards.py` — structured memory CRUD (entity/slot/value)
+- `memory_cards.py` — structured memory CRUD (entity/slot/value); expiry-aware listing and cleanup
+- `entity_profile.py` — consolidated entity memory profiles with contradiction detection
+- `mcp_server.py` — MCP (stdio) server exposing ingest/search/remember/recall as agent-native tools
 - `llm.py` — pluggable LLM, default `OllamaLLM` (qwen3.5:9b)
 - `ingest.py` — document pipeline (PDF via pymupdf, DOCX, XLSX, PPTX, TXT)
 - `search.py` — unified text/vector/hybrid search with RRF fusion

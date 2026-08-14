@@ -11,18 +11,25 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from oramemvid.config import get_settings
-from oramemvid.db import get_pool, close_pool, init_schema, get_capabilities
+from oramemvid.db import close_pool, get_capabilities, get_pool, init_schema
 from oramemvid.embeddings import get_embedding_provider
-from oramemvid.frames import get_frame, list_frames, delete_frame
+from oramemvid.entity_profile import get_entity_profile
+from oramemvid.frames import delete_frame, get_frame, list_frames
 from oramemvid.ingest import ingest_file, ingest_text
 from oramemvid.llm import get_llm_provider
 from oramemvid.memory_cards import (
     create_cards_from_llm,
+    delete_expired_cards,
+    delete_memory_card,
     get_memory_card,
     list_memory_cards,
-    delete_memory_card,
 )
-from oramemvid.search import SearchCapabilityError, search_text, search_vector, search_hybrid
+from oramemvid.search import (
+    SearchCapabilityError,
+    search_hybrid,
+    search_text,
+    search_vector,
+)
 
 settings = get_settings()
 embedding_provider = get_embedding_provider(settings)
@@ -464,6 +471,27 @@ def route_list_memory_cards(
             conn, entity=entity, kind=kind,
             source_frame_id=source_frame_id, limit=limit, offset=offset,
         )
+
+
+@app.get("/memory/profile")
+def route_memory_profile(
+    entity: str = Query(...),
+    include_expired: bool = Query(False),
+):
+    """Consolidated memory profile for an entity: cards grouped by slot,
+    ranked by confidence, contradictions flagged, source frames listed."""
+    with _db_conn() as conn:
+        return get_entity_profile(
+            conn, entity, include_expired=include_expired,
+        )
+
+
+@app.delete("/memory/expired")
+def route_delete_expired_memory_cards():
+    """Delete expired memory cards (temporal-memory hygiene)."""
+    with _db_conn() as conn:
+        deleted = delete_expired_cards(conn)
+        return {"deleted": deleted}
 
 
 @app.get("/memory/{card_id}")
