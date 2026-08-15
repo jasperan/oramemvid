@@ -31,6 +31,32 @@ def _sanitize_text_query(query: str) -> str:
     return " AND ".join(f"{{{token}}}" for token in tokens[:_ORACLE_TEXT_TOKEN_LIMIT])
 
 
+def parse_tag_filters(tags: list[str] | None) -> dict[str, str] | None:
+    """Parse ``key=value`` tag filters (comma-separated, possibly across
+    multiple list items) into a dict. Returns None for empty input.
+
+    This is the canonical tag parser for the search layer: the REST API
+    translates its ValueError into HTTP 400, while the MCP server lets it
+    surface as a tool error.
+    """
+    if not tags:
+        return None
+    parsed: dict[str, str] = {}
+    for raw in tags:
+        for item in raw.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if "=" not in item:
+                raise ValueError("Tag filters must use key=value syntax")
+            key, value = item.split("=", 1)
+            key, value = key.strip(), value.strip()
+            if not key or not value:
+                raise ValueError("Tag filters must include both key and value")
+            parsed[key] = value
+    return parsed or None
+
+
 def _parse_time_bound(value: str, *, is_end: bool) -> tuple[str, datetime]:
     raw = value.strip()
     try:

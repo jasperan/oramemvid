@@ -83,14 +83,15 @@ def get_memory_card(conn: oracledb.Connection, card_id: int) -> dict | None:
     }
 
 
-def list_memory_cards(
-    conn: oracledb.Connection, entity: str | None = None,
-    kind: str | None = None, source_frame_id: int | None = None,
-    limit: int = 50, offset: int = 0,
-    include_expired: bool = True,
-) -> list[dict]:
+def _card_filter_sql(
+    entity: str | None,
+    kind: str | None,
+    source_frame_id: int | None,
+    include_expired: bool,
+) -> tuple[list[str], dict]:
+    """Build the WHERE clause fragments shared by card queries."""
     conditions = []
-    params: dict = {"off": offset, "lim": limit}
+    params: dict = {}
     if entity is not None:
         conditions.append("entity = :entity")
         params["entity"] = entity
@@ -102,6 +103,19 @@ def list_memory_cards(
         params["frame_id"] = source_frame_id
     if not include_expired:
         conditions.append("(expires_at IS NULL OR expires_at > SYSTIMESTAMP)")
+    return conditions, params
+
+
+def list_memory_cards(
+    conn: oracledb.Connection, entity: str | None = None,
+    kind: str | None = None, source_frame_id: int | None = None,
+    limit: int = 50, offset: int = 0,
+    include_expired: bool = True,
+) -> list[dict]:
+    conditions, params = _card_filter_sql(
+        entity, kind, source_frame_id, include_expired,
+    )
+    params.update({"off": offset, "lim": limit})
     where = "WHERE " + " AND ".join(conditions) if conditions else ""
     cursor = conn.cursor()
     cursor.execute(f"""
@@ -130,13 +144,7 @@ def count_memory_cards(
     include_expired: bool = True,
 ) -> int:
     """Count memory cards, optionally excluding expired ones."""
-    conditions = []
-    params: dict = {}
-    if entity is not None:
-        conditions.append("entity = :entity")
-        params["entity"] = entity
-    if not include_expired:
-        conditions.append("(expires_at IS NULL OR expires_at > SYSTIMESTAMP)")
+    conditions, params = _card_filter_sql(entity, None, None, include_expired)
     where = "WHERE " + " AND ".join(conditions) if conditions else ""
     cursor = conn.cursor()
     cursor.execute(f"SELECT COUNT(*) FROM memory_cards {where}", params)

@@ -11,7 +11,7 @@ from __future__ import annotations
 import oracledb
 
 from oramemvid.frames import get_frame
-from oramemvid.memory_cards import list_memory_cards
+from oramemvid.memory_cards import count_memory_cards, list_memory_cards
 
 CONTRADICTION_CONFIDENCE_THRESHOLD = 0.5
 PROFILE_MAX_SOURCES = 10
@@ -43,7 +43,6 @@ def get_entity_profile(
     cards = list_memory_cards(
         conn, entity=entity, limit=10000, include_expired=include_expired,
     )
-    from oramemvid.memory_cards import count_memory_cards
 
     total = count_memory_cards(conn, entity=entity, include_expired=True)
     valid = count_memory_cards(conn, entity=entity, include_expired=False)

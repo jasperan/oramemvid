@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import UTC
+from datetime import UTC, datetime
 
 import oracledb
 from mcp.server.mcpserver import MCPServer
@@ -39,7 +39,12 @@ from oramemvid.memory_cards import (
     get_memory_card,
     list_memory_cards,
 )
-from oramemvid.search import search_hybrid, search_text, search_vector
+from oramemvid.search import (
+    parse_tag_filters,
+    search_hybrid,
+    search_text,
+    search_vector,
+)
 
 _settings: Settings | None = None
 _provider: EmbeddingProvider | None = None
@@ -135,7 +140,7 @@ def create_server(name: str = "oramemvid") -> MCPServer:
     ) -> list[dict]:
         filter_args = {
             "time_from": time_from, "time_to": time_to,
-            "tags": _parse_tags(tags), "entity": entity, "kind": kind,
+            "tags": parse_tag_filters(tags), "entity": entity, "kind": kind,
         }
         if mode == "text":
             return _run(lambda conn: search_text(
@@ -168,8 +173,6 @@ def create_server(name: str = "oramemvid") -> MCPServer:
     ) -> dict:
         expires = None
         if expires_at is not None:
-            from datetime import datetime
-
             parsed = datetime.fromisoformat(expires_at)
             if parsed.tzinfo is not None:
                 parsed = parsed.astimezone(UTC).replace(tzinfo=None)
@@ -262,25 +265,6 @@ def create_server(name: str = "oramemvid") -> MCPServer:
             return {"status": "degraded", "database": str(exc)}
 
     return server
-
-
-def _parse_tags(tags: list[str] | None) -> dict[str, str] | None:
-    if not tags:
-        return None
-    parsed: dict[str, str] = {}
-    for raw in tags:
-        for item in raw.split(","):
-            item = item.strip()
-            if not item:
-                continue
-            if "=" not in item:
-                raise ValueError("Tag filters must use key=value syntax")
-            key, value = item.split("=", 1)
-            key, value = key.strip(), value.strip()
-            if not key or not value:
-                raise ValueError("Tag filters must include both key and value")
-            parsed[key] = value
-    return parsed or None
 
 
 def main() -> None:

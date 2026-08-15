@@ -1,6 +1,7 @@
 import pytest
 
-from oramemvid.mcp_server import _parse_tags, create_server
+from oramemvid.mcp_server import create_server
+from oramemvid.search import parse_tag_filters
 
 
 @pytest.fixture
@@ -31,19 +32,19 @@ async def test_search_tool_requires_valid_mode(server):
 
 
 def test_parse_tags_accepts_list_and_comma_strings():
-    assert _parse_tags(["topic=oracle", "lang=python"]) == {
+    assert parse_tag_filters(["topic=oracle", "lang=python"]) == {
         "topic": "oracle", "lang": "python",
     }
-    assert _parse_tags(["topic=oracle,lang=python"]) == {
+    assert parse_tag_filters(["topic=oracle,lang=python"]) == {
         "topic": "oracle", "lang": "python",
     }
-    assert _parse_tags(None) is None
-    assert _parse_tags([]) is None
+    assert parse_tag_filters(None) is None
+    assert parse_tag_filters([]) is None
 
 
 def test_parse_tags_rejects_malformed():
     with pytest.raises(ValueError, match="key=value"):
-        _parse_tags(["naked"])
+        parse_tag_filters(["naked"])
 
 
 # --- Live-Oracle end-to-end MCP tool tests ---

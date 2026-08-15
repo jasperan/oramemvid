@@ -26,6 +26,7 @@ from oramemvid.memory_cards import (
 )
 from oramemvid.search import (
     SearchCapabilityError,
+    parse_tag_filters,
     search_hybrid,
     search_text,
     search_vector,
@@ -213,42 +214,20 @@ def _validate_office_parseable(file_path: str, suffix: str) -> None:
         raise HTTPException(status_code=415, detail=f"Uploaded file is not a parseable {suffix} file") from exc
 
 
-def _parse_tag_filters(tags: list[str] | None) -> dict[str, str] | None:
-    if not tags:
-        return None
-    parsed: dict[str, str] = {}
-    for raw in tags:
-        for item in raw.split(","):
-            item = item.strip()
-            if not item:
-                continue
-            if "=" not in item:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Tag filters must use key=value syntax",
-                )
-            key, value = item.split("=", 1)
-            key = key.strip()
-            value = value.strip()
-            if not key or not value:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Tag filters must include both key and value",
-                )
-            parsed[key] = value
-    return parsed or None
-
-
 def _search_filter_args(
     tags: list[str] | None,
     entity: str | None,
     kind: str | None,
 ) -> dict:
-    return {
-        "tags": _parse_tag_filters(tags),
-        "entity": entity,
-        "kind": kind,
-    }
+    try:
+        return {
+            "tags": parse_tag_filters(tags),
+            "entity": entity,
+            "kind": kind,
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
 
 
 def _run_filtered_search(
