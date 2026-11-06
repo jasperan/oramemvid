@@ -220,6 +220,28 @@ async def test_upload_middleware_rejects_large_content_length_before_route(monke
     assert response.status_code == 413
 
 
+@pytest.mark.asyncio
+async def test_text_ingest_oversize_request_rejected_before_route(monkeypatch):
+    def fail_route(*args, **kwargs):
+        raise AssertionError("route should not run")
+
+    monkeypatch.setattr(api, "ingest_text", fail_route)
+    monkeypatch.setattr(api, "settings", Settings(oracle_password="test", max_upload_bytes=3))
+
+    transport = ASGITransport(app=api.app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/ingest/text",
+            content=b"{}",
+            headers={
+                "content-type": "application/json",
+                "content-length": str(api._MULTIPART_OVERHEAD_BYTES + 4),
+            },
+        )
+
+    assert response.status_code == 413
+
+
 def test_search_tag_parse_error_rejects_before_db_connection(monkeypatch):
     def fail_get_conn():
         raise AssertionError("DB connection should not be acquired")

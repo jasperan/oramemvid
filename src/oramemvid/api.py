@@ -273,7 +273,7 @@ app = FastAPI(title="oramemvid", version="0.1.0", lifespan=lifespan)
 
 @app.middleware("http")
 async def reject_large_upload_requests(request: Request, call_next):
-    if request.url.path == "/ingest/file" and request.method == "POST":
+    if request.url.path in ("/ingest/file", "/ingest/text") and request.method == "POST":
         content_length = request.headers.get("content-length")
         limit = settings.max_upload_bytes + _MULTIPART_OVERHEAD_BYTES
         if content_length is None:
